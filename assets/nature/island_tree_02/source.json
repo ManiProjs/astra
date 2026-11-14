@@ -1,0 +1,18 @@
+{
+  "asset_id": "island_tree_02",
+  "name": "Island Tree 02",
+  "authors": {
+    "Rob Tuytel": "scanning, processing",
+    "Rico Cilliers": "cleanup, processing"
+  },
+  "license": "CC0 1.0",
+  "source": "https://polyhaven.com/a/island_tree_02",
+  "polycount": 1762064,
+  "dimensions_mm": [
+    8485.51321029663,
+    4078.6155462265015,
+    3408.9039135724306
+  ],
+  "lods": true,
+  "resolution": "1k"
+}

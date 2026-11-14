@@ -1,0 +1,2 @@
+elapsed_seconds,frames,average_fps,avg_cpu_ms,avg_gpu_ms,render_scale,draw_count,resident_chunks
+6.017,2019,335.574,1.122,0.000,1.000,48,9

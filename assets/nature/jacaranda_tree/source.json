@@ -1,0 +1,18 @@
+{
+  "asset_id": "jacaranda_tree",
+  "name": "Jacaranda Tree",
+  "authors": {
+    "Rob Tuytel": "guidance",
+    "Rico Cilliers": "All"
+  },
+  "license": "CC0 1.0",
+  "source": "https://polyhaven.com/a/jacaranda_tree",
+  "polycount": 312356,
+  "dimensions_mm": [
+    24169.849395751953,
+    18028.766632080078,
+    19829.095542430878
+  ],
+  "lods": true,
+  "resolution": "1k"
+}

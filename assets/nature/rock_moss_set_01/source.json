@@ -1,0 +1,17 @@
+{
+  "asset_id": "rock_moss_set_01",
+  "name": "Rock Moss Set 01",
+  "authors": {
+    "Kless Gyzen": "All"
+  },
+  "license": "CC0 1.0",
+  "source": "https://polyhaven.com/a/rock_moss_set_01",
+  "polycount": 63127,
+  "dimensions_mm": [
+    8004.603862762451,
+    6948.764801025391,
+    1768.319845199585
+  ],
+  "lods": null,
+  "resolution": "1k"
+}

@@ -1,0 +1,18 @@
+{
+  "asset_id": "fir_sapling",
+  "name": "Fir Sapling",
+  "authors": {
+    "Rob Tuytel": "photography",
+    "Rico Cilliers": "modeling"
+  },
+  "license": "CC0 1.0",
+  "source": "https://polyhaven.com/a/fir_sapling",
+  "polycount": 433021,
+  "dimensions_mm": [
+    2742.7279949188232,
+    826.4130651950836,
+    1300.737977027893
+  ],
+  "lods": null,
+  "resolution": "1k"
+}

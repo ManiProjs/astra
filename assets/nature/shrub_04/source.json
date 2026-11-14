@@ -1,0 +1,17 @@
+{
+  "asset_id": "shrub_04",
+  "name": "Shrub 04",
+  "authors": {
+    "Rico Cilliers": "All"
+  },
+  "license": "CC0 1.0",
+  "source": "https://polyhaven.com/a/shrub_04",
+  "polycount": 47813,
+  "dimensions_mm": [
+    746.7864416539669,
+    186.9201734662056,
+    280.6698549538851
+  ],
+  "lods": true,
+  "resolution": "1k"
+}

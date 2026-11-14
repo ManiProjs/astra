@@ -1,0 +1,28 @@
+# Build and generated files
+.cache/
+build/
+cmake-build-*/
+target/
+compile_commands.json
+
+# IDE and editor state
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Xcode and Apple build products
+DerivedData/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+
+# Profiling and crash output
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+*.dSYM/
+*.crash
