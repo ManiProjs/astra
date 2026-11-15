@@ -106,7 +106,9 @@ The macOS Metal path now includes:
   weighted blended order-independent transparency with accumulation/revealage and temporal resolve for BLEND
   materials; a sorted-alpha fallback on paths without OIT; and double-sided normal orientation.
 - An executable per-frame render graph: Metal compiles pass dependencies and invokes native cascaded-shadow, sky,
-  geometry/motion-vector, temporal-resolve, and tone-map callbacks in graph order. Imported backend textures
+  geometry/motion-vector, GTAO composition, temporal-resolve, and tone-map callbacks in graph order. Opaque shading
+  writes indirect diffuse to a dedicated MRT; the depth-reconstructed horizon pass attenuates only that contribution
+  before TAA. Imported backend textures
   participate in hazard tracking.
 - A GPU-selected virtual-geometry hierarchy: cluster trees are packed and uploaded as resident pages; Metal compute
   selects the projected-error LOD cut using conservative transform bounds, camera-forward depth for camera passes,
@@ -134,10 +136,14 @@ budgets remain important.
 - Only the macOS AppKit/Metal backend is implemented. Windows/Linux windows and graphics backends remain planned.
 - HDR is used for the linear scene target and tone-mapped to an SDR sRGB drawable; direct EDR/HDR display output
   is not implemented.
-- The forward renderer currently supports one directional key light. It has no point/spot light list or clustered
-  light culling, no screen-space ambient occlusion, no dynamic global illumination, no screen-space reflections
+- The forward renderer supports one directional key light and a bounded list of up to 32 point emitters. Point
+  emitters use linear radiometric intensity, inverse-square attenuation and a smooth finite-range cutoff; they do
+  not yet cast local shadows and are not clustered/tiled. The initial full-resolution GTAO path uses 8 directions × 6
+  depth-reconstructed samples and affects indirect diffuse only; `SceneSettings::gtao` validates and controls its
+  enablement, world-space radius, strength and bias. It has no dedicated AO history, bilateral denoiser or upsampling
+  path yet. There is no dynamic global illumination, no screen-space reflections
   or local reflection probes, and no bloom or automatic exposure. Material occlusion maps are not substitutes for
-  screen-space AO. Directional-light radiance is now a scene setting instead of a shader constant.
+  screen-space AO. Directional-light radiance is a scene setting instead of a shader constant.
 - Metal exposes engine-level image-based lighting through `Renderer::create_environment`: linear RGBA32F
   equirectangular input is converted to a cubemap, mipmapped, convolved into diffuse irradiance, GGX-prefiltered
   across roughness levels, and paired with a split-sum BRDF integration LUT. PBR materials use the irradiance,

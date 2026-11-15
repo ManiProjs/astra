@@ -33,10 +33,13 @@ and a production render graph. Only the Metal backend and macOS native window pa
 
 - [ ] Replace shader-embedded light energy and fog constants with validated scene/environment
   parameters and a consistent linear-light convention.
-- [ ] Add point and spot lights with inverse-square attenuation, physically meaningful range falloff,
-  and bounded light lists; follow with clustered/tiled light culling before scaling scene counts.
-- [ ] Add robust screen-space ambient occlusion (GTAO-class), temporal stabilization and bilateral
-  upsampling; keep material AO as a separate input rather than treating it as screen-space AO.
+- [x] Add a bounded point-light list (32 emitters) with linear radiant-intensity units,
+  inverse-square attenuation and smooth finite-range cutoff. Spot lights, local shadows and
+  clustered/tiled culling remain open before scaling scene counts.
+- [x] Add an initial full-resolution, depth-reconstructed horizon AO pass (8 screen directions × 6
+  radial samples) and apply it only to the separately rendered indirect-diffuse contribution. The
+  existing TAA resolves the composited result; dedicated AO history, depth/normal-aware denoising,
+  bilateral upsampling and GPU image regression remain open before production use.
 - [ ] Add contact-shadow support and a scalable shadow-filtering strategy beyond fixed five-tap PCF.
 - [ ] Add anisotropic texture filtering and material sampler controls; validate normal/tangent-space
   handling and texture color-space correctness.
@@ -48,8 +51,12 @@ and a production render graph. Only the Metal backend and macOS native window pa
 
 - [ ] Add local reflection probes with parallax correction and blending.
 - [ ] Add screen-space reflections with confidence, roughness-aware filtering and environment fallback.
-- [ ] Add a scalable real-time GI path (begin with a validated probe/voxel or screen-space solution;
-  evaluate hardware ray tracing only behind device capabilities).
+- [ ] Add a bounded one-bounce screen-space diffuse GI (SSGI) path using explicit direct-radiance and
+  receiver-albedo buffers, depth-aware ray marching, confidence fades, temporal reprojection and
+  the existing global IBL as an off-screen fallback. Validate half-resolution quality and cost before
+  enabling it by default; screen-space misses/leaks remain inherent limitations.
+- [ ] Evolve beyond screen space with a scalable probe/voxel GI solution; evaluate hardware ray
+  tracing only behind device capabilities and explicit acceleration-structure support.
 - [ ] Ensure direct and indirect energy are not double-counted and that AO affects indirect lighting
   appropriately rather than indiscriminately darkening direct light.
 - [ ] Add reference scenes for static/dynamic objects, foliage, glossy/wet surfaces and disocclusion.
@@ -106,11 +113,13 @@ and a production render graph. Only the Metal backend and macOS native window pa
 
 1. Establish correct scene-light controls and fix deformation consistency across color, history and
    shadow passes.
-2. Add GTAO using a depth prepass and a properly integrated AO pass; test it on real Metal frames.
-3. Add point/spot lights and a bounded light-list contract, then clustered culling.
-4. Add automatic exposure and bloom after TAA.
-5. Build terrain layers and biome-driven world generation; move those systems out of the example.
-6. Add reflection/GI and physical atmosphere/cloud shadows, then water.
+2. Validate and improve the integrated depth-driven GTAO pass on real Metal frames; add dedicated
+   temporal AO history, edge-aware filtering and image regression.
+3. Add spot lights, local shadows and clustered culling for the bounded light-list contract.
+4. Prototype one-bounce SSGI on top of the new indirect-diffuse resource, with IBL fallback.
+5. Add automatic exposure and bloom after TAA.
+6. Build terrain layers and biome-driven world generation; move those systems out of the example.
+7. Add reflection probes/SSR and a scalable GI solution, then physical atmosphere/cloud shadows and water.
 
 ## Completion gate
 

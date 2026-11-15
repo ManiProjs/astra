@@ -447,6 +447,27 @@ struct DrawItem final {
     std::uint32_t index_count{};
 };
 
+// Isotropic local emitter. intensity is radiant intensity (W/sr when world units
+// are meters); the shader evaluates inverse-square irradiance and a smooth cutoff.
+struct PointLight final {
+    Vec3 position{};
+    float range{10.0F};
+    Vec3 intensity{};
+    float padding{};
+};
+static_assert(sizeof(PointLight) == 32);
+
+inline constexpr std::size_t maximum_scene_point_lights = 32;
+
+// Screen-space horizon AO settings. Radius is in world units; strength is a
+// dimensionless visibility multiplier and bias suppresses self-occlusion.
+struct GtaoSettings final {
+    bool enabled{true};
+    float radius{1.25F};
+    float strength{1.15F};
+    float bias{0.035F};
+};
+
 struct SceneSettings final {
     Vec3 camera_position{};
     Vec3 light_direction{-0.42F, -0.82F, -0.31F};
@@ -470,6 +491,10 @@ struct SceneSettings final {
     // Kept separate from direction so day/night systems can change sun energy
     // and color without rebuilding scene geometry or editing shader constants.
     Vec3 directional_light_radiance{3.8F, 3.55F, 3.15F};
+    // Bounded local emitters, expressed in world space and linear radiometric units.
+    std::span<const PointLight> point_lights{};
+    // Appended to preserve existing positional SceneSettings aggregate prefixes.
+    GtaoSettings gtao{};
 };
 
 [[nodiscard]] inline std::expected<void, std::string>
@@ -487,6 +512,20 @@ validate_scene_lighting(const SceneSettings& settings) {
         settings.directional_light_radiance.y < 0.0F ||
         settings.directional_light_radiance.z < 0.0F)
         return std::unexpected("Directional light radiance must be finite and non-negative.");
+    if (settings.point_lights.size() > maximum_scene_point_lights)
+        return std::unexpected("A scene may contain at most 32 point lights.");
+    for (const auto& light : settings.point_lights) {
+        if (!finite(light.position) || !finite(light.intensity) ||
+            !std::isfinite(light.range) || light.range <= 0.0F ||
+            light.intensity.x < 0.0F || light.intensity.y < 0.0F || light.intensity.z < 0.0F)
+            return std::unexpected("Point lights require finite positions, positive ranges and non-negative intensity.");
+    }
+    if (!std::isfinite(settings.gtao.radius) || settings.gtao.radius < 0.0F ||
+        settings.gtao.radius > 10.0F || !std::isfinite(settings.gtao.strength) ||
+        settings.gtao.strength < 0.0F || settings.gtao.strength > 2.0F ||
+        !std::isfinite(settings.gtao.bias) || settings.gtao.bias < 0.0F ||
+        settings.gtao.bias > 0.5F)
+        return std::unexpected("GTAO radius, strength or bias is outside its supported finite range.");
     return {};
 }
 

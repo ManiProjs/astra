@@ -77,6 +77,11 @@ struct PackedMorphDelta final {
   float tangent[4];
 };
 
+struct PackedPointLight final {
+  float position_range[4];
+  float intensity[4];
+};
+
 static_assert(sizeof(rhi::MeshVertex) == 96);
 static_assert(sizeof(PackedMeshVertex) == 52);
 static_assert(offsetof(PackedMeshVertex, position) == 0);
@@ -95,6 +100,8 @@ static_assert(offsetof(PackedStaticMeshVertex, texcoord0) == 24);
 static_assert(offsetof(PackedStaticMeshVertex, tangent) == 28);
 static_assert(offsetof(PackedStaticMeshVertex, texcoord1) == 32);
 static_assert(sizeof(PackedMorphDelta) == 48);
+static_assert(sizeof(PackedPointLight) == 32);
+static_assert(offsetof(PackedPointLight, intensity) == 16);
 
 std::int16_t pack_snorm16(float value) {
   return static_cast<std::int16_t>(std::lround(std::clamp(value, -1.0F, 1.0F) * 32767.0F));
@@ -736,7 +743,7 @@ struct SceneUniforms final {
   float uv_transform[5][4]; // offset.xy, scale.xy
   float uv_rotation[5][4];  // cos(rotation), sin(rotation), reserved, reserved
   float environment_flags[4]; // enabled, maximum prefilter mip, reserved, reserved
-  std::uint32_t morph_flags[4]; // target count, per-instance weights, vertex count, reserved
+  std::uint32_t morph_flags[4]; // target count, per-instance weights, vertex count, point-light count
 };
 
 struct alignas(16) IblDispatchUniforms final {
@@ -765,6 +772,13 @@ struct TaaUniforms final {
   float taa_params[4]{0.92F, 0.0F, 0.0F, 0.0F};
 };
 
+struct GtaoUniforms final {
+  float inverse_view_projection[16];
+  float camera_position[4];
+  float parameters[4]; // radius in world units, strength, bias, reserved
+  float jitter[4]; // current NDC projection jitter xy
+};
+
 static_assert(sizeof(rhi::MeshVertex) == 96);
 static_assert(offsetof(rhi::MeshVertex, texcoord1_u) == 48);
 static_assert(offsetof(rhi::MeshVertex, tangent_x) == 56);
@@ -790,6 +804,7 @@ static_assert(offsetof(TaaUniforms, previous_camera_position) == 80);
 static_assert(offsetof(TaaUniforms, jitter) == 96);
 static_assert(offsetof(TaaUniforms, taa_params) == 112);
 static_assert(sizeof(TaaUniforms) == 128);
+static_assert(sizeof(GtaoUniforms) == 112);
 
 MTLVertexDescriptor* make_vertex_descriptor() {
   MTLVertexDescriptor* descriptor = [[MTLVertexDescriptor alloc] init];
@@ -948,6 +963,8 @@ public:
     id<MTLFunction> sky_fragment = [library newFunctionWithName:@"astra_sky_fragment"];
     id<MTLFunction> tonemap_fragment = [library newFunctionWithName:@"astra_tonemap_fragment"];
     id<MTLFunction> taa_fragment = [library newFunctionWithName:@"astra_taa_fragment"];
+    id<MTLFunction> gtao_composite_fragment =
+        [library newFunctionWithName:@"astra_gtao_composite_fragment"];
     id<MTLFunction> ibl_equirect = [library newFunctionWithName:@"astra_ibl_equirect_to_cube"];
     id<MTLFunction> ibl_irradiance = [library newFunctionWithName:@"astra_ibl_irradiance"];
     id<MTLFunction> ibl_prefilter = [library newFunctionWithName:@"astra_ibl_prefilter"];
@@ -955,6 +972,7 @@ public:
     if (scene_vertex == nil || scene_fragment == nil || shadow_vertex == nil ||
         shadow_fragment == nil || virtual_geometry_cull == nil || fullscreen_vertex == nil ||
         sky_fragment == nil || tonemap_fragment == nil || taa_fragment == nil ||
+        gtao_composite_fragment == nil ||
         ibl_equirect == nil || ibl_irradiance == nil || ibl_prefilter == nil || ibl_brdf == nil) {
       return std::unexpected(
           rhi::RenderError{.code = rhi::RenderErrorCode::shader_compilation_failed,
@@ -995,6 +1013,7 @@ public:
     scene_descriptor.colorAttachments[2].pixelFormat = MTLPixelFormatR8Unorm;
     scene_descriptor.colorAttachments[3].pixelFormat = MTLPixelFormatRGBA16Float;
     scene_descriptor.colorAttachments[4].pixelFormat = MTLPixelFormatR16Float;
+    scene_descriptor.colorAttachments[5].pixelFormat = MTLPixelFormatRGBA16Float;
     scene_descriptor.colorAttachments[3].writeMask = MTLColorWriteMaskNone;
     scene_descriptor.colorAttachments[4].writeMask = MTLColorWriteMaskNone;
     scene_descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
@@ -1015,11 +1034,13 @@ public:
     blend_descriptor.colorAttachments[2].pixelFormat = MTLPixelFormatR8Unorm;
     blend_descriptor.colorAttachments[3].pixelFormat = MTLPixelFormatRGBA16Float;
     blend_descriptor.colorAttachments[4].pixelFormat = MTLPixelFormatR16Float;
+    blend_descriptor.colorAttachments[5].pixelFormat = MTLPixelFormatRGBA16Float;
     blend_descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     // Transparent fragments only write the accumulation/revealage attachments.
     // Opaque color, motion and reactive outputs are preserved unchanged.
     for (NSUInteger attachment = 0; attachment < 3; ++attachment)
       blend_descriptor.colorAttachments[attachment].writeMask = MTLColorWriteMaskNone;
+    blend_descriptor.colorAttachments[5].writeMask = MTLColorWriteMaskNone;
     MTLRenderPipelineColorAttachmentDescriptor* accumulation_attachment =
         blend_descriptor.colorAttachments[3];
     accumulation_attachment.blendingEnabled = YES;
@@ -1112,6 +1133,8 @@ public:
     sky_descriptor.colorAttachments[4].pixelFormat = MTLPixelFormatR16Float;
     sky_descriptor.colorAttachments[3].writeMask = MTLColorWriteMaskNone;
     sky_descriptor.colorAttachments[4].writeMask = MTLColorWriteMaskNone;
+    sky_descriptor.colorAttachments[5].pixelFormat = MTLPixelFormatRGBA16Float;
+    sky_descriptor.colorAttachments[5].writeMask = MTLColorWriteMaskNone;
     sky_descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     id<MTLRenderPipelineState> sky_pipeline =
         [device newRenderPipelineStateWithDescriptor:sky_descriptor error:&error];
@@ -1139,6 +1162,17 @@ public:
     id<MTLRenderPipelineState> taa_pipeline =
         [device newRenderPipelineStateWithDescriptor:taa_descriptor error:&error];
     if (taa_pipeline == nil) {
+      return std::unexpected(
+          make_error(rhi::RenderErrorCode::pipeline_creation_failed, error.localizedDescription));
+    }
+
+    MTLRenderPipelineDescriptor* gtao_descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    gtao_descriptor.vertexFunction = fullscreen_vertex;
+    gtao_descriptor.fragmentFunction = gtao_composite_fragment;
+    gtao_descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+    id<MTLRenderPipelineState> gtao_pipeline =
+        [device newRenderPipelineStateWithDescriptor:gtao_descriptor error:&error];
+    if (gtao_pipeline == nil) {
       return std::unexpected(
           make_error(rhi::RenderErrorCode::pipeline_creation_failed, error.localizedDescription));
     }
@@ -1222,7 +1256,7 @@ public:
     auto result = std::unique_ptr<MetalRenderDevice>{new MetalRenderDevice{
         layer, device, queue, scene_pipeline, blend_pipeline, shadow_pipeline,
         static_scene_pipeline, static_blend_pipeline, static_shadow_pipeline, sky_pipeline,
-        post_pipeline, taa_pipeline, scene_fragment_argument_encoder, virtual_geometry_cull_pipeline,
+        post_pipeline, taa_pipeline, gtao_pipeline, scene_fragment_argument_encoder, virtual_geometry_cull_pipeline,
         virtual_geometry_encode_icb_pipeline, virtual_geometry_icb_argument_encoder,
         virtual_geometry_icb_supported,
         ibl_equirect_pipeline, ibl_irradiance_pipeline, ibl_prefilter_pipeline, ibl_brdf_pipeline,
@@ -1718,6 +1752,7 @@ private:
       id<MTLRenderPipelineState> static_shadow_pipeline,
       id<MTLRenderPipelineState> sky_pipeline,
       id<MTLRenderPipelineState> post_pipeline, id<MTLRenderPipelineState> taa_pipeline,
+      id<MTLRenderPipelineState> gtao_pipeline,
       id<MTLArgumentEncoder> scene_fragment_argument_encoder,
       id<MTLComputePipelineState> virtual_geometry_cull_pipeline,
       id<MTLComputePipelineState> virtual_geometry_encode_icb_pipeline,
@@ -1737,6 +1772,7 @@ private:
         static_scene_pipeline_(static_scene_pipeline), static_blend_pipeline_(static_blend_pipeline),
         static_shadow_pipeline_(static_shadow_pipeline),
         sky_pipeline_(sky_pipeline), post_pipeline_(post_pipeline), taa_pipeline_(taa_pipeline),
+        gtao_pipeline_(gtao_pipeline),
         scene_fragment_argument_encoder_(scene_fragment_argument_encoder),
         virtual_geometry_cull_pipeline_(virtual_geometry_cull_pipeline),
         virtual_geometry_encode_icb_pipeline_(virtual_geometry_encode_icb_pipeline),
@@ -1754,12 +1790,15 @@ private:
   }
 
   bool ensure_scene_targets(NSUInteger width, NSUInteger height) {
-    if (hdr_texture_ != nil && depth_texture_ != nil && velocity_texture_ != nil &&
+    if (hdr_texture_ != nil && indirect_diffuse_texture_ != nil && gtao_hdr_texture_ != nil &&
+        depth_texture_ != nil && velocity_texture_ != nil &&
         reactive_texture_ != nil &&
         oit_accumulation_texture_ != nil && oit_revealage_texture_ != nil &&
         history_color_[0] != nil && history_color_[1] != nil && history_depth_[0] != nil &&
         history_depth_[1] != nil && hdr_texture_.width == width && hdr_texture_.height == height &&
         depth_texture_.width == width && depth_texture_.height == height &&
+        indirect_diffuse_texture_.width == width && indirect_diffuse_texture_.height == height &&
+        gtao_hdr_texture_.width == width && gtao_hdr_texture_.height == height &&
         velocity_texture_.width == width && velocity_texture_.height == height &&
         reactive_texture_.width == width && reactive_texture_.height == height &&
         oit_accumulation_texture_.width == width && oit_accumulation_texture_.height == height &&
@@ -1769,6 +1808,10 @@ private:
         MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     id<MTLTexture> new_hdr = make_color_texture(device_, MTLPixelFormatRGBA16Float, width, height,
                                                 sampled_render_target);
+    id<MTLTexture> new_indirect_diffuse = make_color_texture(
+        device_, MTLPixelFormatRGBA16Float, width, height, sampled_render_target);
+    id<MTLTexture> new_gtao_hdr = make_color_texture(
+        device_, MTLPixelFormatRGBA16Float, width, height, sampled_render_target);
     id<MTLTexture> new_velocity = make_color_texture(device_, MTLPixelFormatRG16Float, width,
                                                      height, sampled_render_target);
     id<MTLTexture> new_reactive =
@@ -1787,7 +1830,8 @@ private:
       new_history_depth[index] =
           make_color_texture(device_, MTLPixelFormatR16Float, width, height, sampled_render_target);
     }
-    if (new_hdr == nil || new_velocity == nil || new_reactive == nil ||
+    if (new_hdr == nil || new_indirect_diffuse == nil || new_gtao_hdr == nil ||
+        new_velocity == nil || new_reactive == nil ||
         new_oit_accumulation == nil || new_oit_revealage == nil || new_depth == nil ||
         std::ranges::any_of(new_history_color,
                             [](id<MTLTexture> texture) { return texture == nil; }) ||
@@ -1795,6 +1839,8 @@ private:
                             [](id<MTLTexture> texture) { return texture == nil; }))
       return false;
     hdr_texture_ = new_hdr;
+    indirect_diffuse_texture_ = new_indirect_diffuse;
+    gtao_hdr_texture_ = new_gtao_hdr;
     velocity_texture_ = new_velocity;
     reactive_texture_ = new_reactive;
     oit_accumulation_texture_ = new_oit_accumulation;
@@ -1936,6 +1982,7 @@ private:
       set_color(uniforms.base_color, {1.0F, 1.0F, 1.0F, 1.0F});
     }
     uniforms.skin_flags[0] = static_cast<float>(item.joint_matrices.size());
+    uniforms.morph_flags[3] = static_cast<std::uint32_t>(settings.point_lights.size());
     const bool has_previous_skin =
         item.has_previous_transform &&
         item.previous_joint_matrices.size() == item.joint_matrices.size();
@@ -2024,7 +2071,8 @@ private:
                             std::size_t cascade_index = 0,
                             id<MTLBuffer> fragment_argument_buffer = nil,
                             NSUInteger fragment_argument_stride = 0,
-                            NSUInteger* fragment_argument_cursor = nullptr) {
+                            NSUInteger* fragment_argument_cursor = nullptr,
+                            id<MTLBuffer> point_light_buffer = nil) {
     const rhi::Matrix4* culling_view_projection =
         shadow_pass ? &shadows.matrices[cascade_index] : view_projection;
     const float world_units_per_texel =
@@ -2054,6 +2102,9 @@ private:
       pass.colorAttachments[4].texture = oit_revealage_texture_;
       pass.colorAttachments[4].loadAction = MTLLoadActionLoad;
       pass.colorAttachments[4].storeAction = MTLStoreActionStore;
+      pass.colorAttachments[5].texture = indirect_diffuse_texture_;
+      pass.colorAttachments[5].loadAction = MTLLoadActionLoad;
+      pass.colorAttachments[5].storeAction = MTLStoreActionStore;
       pass.depthAttachment.texture = depth_texture_;
       pass.depthAttachment.loadAction = MTLLoadActionClear;
       pass.depthAttachment.storeAction = MTLStoreActionStore;
@@ -2401,6 +2452,7 @@ private:
         }
         [scene_fragment_argument_encoder_ setSamplerState:ibl_sampler_ atIndex:19];
         [encoder setFragmentBuffer:fragment_argument_buffer offset:argument_offset atIndex:2];
+        [encoder setFragmentBuffer:point_light_buffer offset:0 atIndex:3];
       }
       if (virtual_geometry != nullptr) {
         if (!shadow_pass && virtual_geometry->icb() != nil) {
@@ -2599,6 +2651,31 @@ private:
       }
       NSUInteger fragment_argument_cursor = 0;
 
+      std::vector<PackedPointLight> packed_point_lights;
+      packed_point_lights.reserve(std::max<std::size_t>(1U, frame_settings.point_lights.size()));
+      for (const auto& light : frame_settings.point_lights) {
+        PackedPointLight packed{};
+        packed.position_range[0] = light.position.x;
+        packed.position_range[1] = light.position.y;
+        packed.position_range[2] = light.position.z;
+        packed.position_range[3] = light.range;
+        packed.intensity[0] = light.intensity.x;
+        packed.intensity[1] = light.intensity.y;
+        packed.intensity[2] = light.intensity.z;
+        packed_point_lights.push_back(packed);
+      }
+      if (packed_point_lights.empty())
+        packed_point_lights.emplace_back();
+      id<MTLBuffer> point_light_buffer = [device_
+          newBufferWithBytes:packed_point_lights.data()
+                      length:packed_point_lights.size() * sizeof(PackedPointLight)
+                     options:MTLResourceStorageModeShared];
+      if (point_light_buffer == nil) {
+        return std::unexpected(rhi::RenderError{
+            .code = rhi::RenderErrorCode::resource_creation_failed,
+            .message = "Metal could not allocate the per-frame point-light buffer."});
+      }
+
       rhi::RenderGraph graph;
       const auto texture_resource = [width, height](rhi::PixelFormat format,
                                                     rhi::TextureUsage usage) {
@@ -2626,6 +2703,14 @@ private:
           graph.import_texture("scene-hdr", texture_resource(rhi::PixelFormat::rgba16_float,
                                                              rhi::TextureUsage::color_attachment |
                                                                  rhi::TextureUsage::sampled));
+      const auto indirect_diffuse_resource = graph.import_texture(
+          "scene-indirect-diffuse",
+          texture_resource(rhi::PixelFormat::rgba16_float,
+                           rhi::TextureUsage::color_attachment | rhi::TextureUsage::sampled));
+      const auto gtao_hdr_resource = graph.import_texture(
+          "gtao-composited-hdr",
+          texture_resource(rhi::PixelFormat::rgba16_float,
+                           rhi::TextureUsage::color_attachment | rhi::TextureUsage::sampled));
       const auto velocity_resource = graph.import_texture(
           "scene-motion-vectors",
           texture_resource(rhi::PixelFormat::rg16_float,
@@ -2709,6 +2794,10 @@ private:
         pass.colorAttachments[4].loadAction = MTLLoadActionClear;
         pass.colorAttachments[4].storeAction = MTLStoreActionStore;
         pass.colorAttachments[4].clearColor = MTLClearColorMake(1.0, 1.0, 1.0, 1.0);
+        pass.colorAttachments[5].texture = indirect_diffuse_texture_;
+        pass.colorAttachments[5].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[5].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[5].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
         pass.depthAttachment.texture = depth_texture_;
         pass.depthAttachment.loadAction = MTLLoadActionClear;
         pass.depthAttachment.storeAction = MTLStoreActionStore;
@@ -2764,6 +2853,7 @@ private:
         return std::expected<void, std::string>{};
       });
       if (!graph.use(sky, hdr_resource, rhi::GraphAccess::write) ||
+          !graph.use(sky, indirect_diffuse_resource, rhi::GraphAccess::write) ||
           !graph.use(sky, depth_resource, rhi::GraphAccess::write) ||
           !graph.use(sky, velocity_resource, rhi::GraphAccess::write) ||
           !graph.use(sky, reactive_resource, rhi::GraphAccess::write) ||
@@ -2777,11 +2867,13 @@ private:
         const auto geometry =
             graph.add_pass("opaque-geometry", [this, command, frame_view_projection, frame_settings,
                                                shadows, &draw_items, fragment_argument_buffer,
+                                               point_light_buffer,
                                                fragment_argument_stride,
                                                &fragment_argument_cursor]() {
               if (!encode_geometry_pass(command, frame_view_projection, frame_settings, shadows,
                                         draw_items, false, false, 0, fragment_argument_buffer,
-                                        fragment_argument_stride, &fragment_argument_cursor))
+                                        fragment_argument_stride, &fragment_argument_cursor,
+                                        point_light_buffer))
                 return std::expected<void, std::string>{
                     std::unexpected("could not encode HDR geometry or allocate a skin palette")};
               return std::expected<void, std::string>{};
@@ -2791,6 +2883,7 @@ private:
           shadow_reads_valid =
               shadow_reads_valid && graph.use(geometry, resource, rhi::GraphAccess::read);
         if (!shadow_reads_valid || !graph.use(geometry, hdr_resource, rhi::GraphAccess::write) ||
+            !graph.use(geometry, indirect_diffuse_resource, rhi::GraphAccess::write) ||
             !graph.use(geometry, velocity_resource, rhi::GraphAccess::write) ||
             !graph.use(geometry, reactive_resource, rhi::GraphAccess::write) ||
             !graph.use(geometry, depth_resource, rhi::GraphAccess::write))
@@ -2801,12 +2894,13 @@ private:
         const auto transparent =
             graph.add_pass("weighted-blended-oit", [this, command, frame_view_projection,
                                                      frame_settings, shadows, &draw_items,
-                                                     fragment_argument_buffer,
+                                                     fragment_argument_buffer, point_light_buffer,
                                                      fragment_argument_stride,
                                                      &fragment_argument_cursor]() {
               if (!encode_geometry_pass(command, frame_view_projection, frame_settings, shadows,
                                         draw_items, false, true, 0, fragment_argument_buffer,
-                                        fragment_argument_stride, &fragment_argument_cursor))
+                                        fragment_argument_stride, &fragment_argument_cursor,
+                                        point_light_buffer))
                 return std::expected<void, std::string>{
                     std::unexpected("could not encode weighted blended transparency")};
               return std::expected<void, std::string>{};
@@ -2824,6 +2918,46 @@ private:
                                .message = "Invalid weighted blended OIT pass resource declaration."});
       }
 
+      const auto gtao = graph.add_pass(
+          "ground-truth-ambient-occlusion",
+          [this, command, frame_settings, current_jitter]() {
+            MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.colorAttachments[0].texture = gtao_hdr_texture_;
+            pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> encoder =
+                [command renderCommandEncoderWithDescriptor:pass];
+            if (encoder == nil)
+              return std::expected<void, std::string>{
+                  std::unexpected("could not create GTAO composite encoder")};
+            [encoder setRenderPipelineState:gtao_pipeline_];
+            [encoder setFragmentTexture:hdr_texture_ atIndex:0];
+            [encoder setFragmentTexture:indirect_diffuse_texture_ atIndex:1];
+            [encoder setFragmentTexture:depth_texture_ atIndex:2];
+            GtaoUniforms uniforms{};
+            std::copy_n(frame_settings.inverse_view_projection.values.data(), 16,
+                        uniforms.inverse_view_projection);
+            uniforms.camera_position[0] = frame_settings.camera_position.x;
+            uniforms.camera_position[1] = frame_settings.camera_position.y;
+            uniforms.camera_position[2] = frame_settings.camera_position.z;
+            uniforms.parameters[0] = frame_settings.gtao.enabled ? frame_settings.gtao.radius : 0.0F;
+            uniforms.parameters[1] = frame_settings.gtao.strength;
+            uniforms.parameters[2] = frame_settings.gtao.bias;
+            uniforms.jitter[0] = current_jitter.x;
+            uniforms.jitter[1] = current_jitter.y;
+            [encoder setFragmentBytes:&uniforms length:sizeof(GtaoUniforms) atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [encoder endEncoding];
+            return std::expected<void, std::string>{};
+          });
+      if (!graph.use(gtao, hdr_resource, rhi::GraphAccess::read) ||
+          !graph.use(gtao, indirect_diffuse_resource, rhi::GraphAccess::read) ||
+          !graph.use(gtao, depth_resource, rhi::GraphAccess::read) ||
+          !graph.use(gtao, gtao_hdr_resource, rhi::GraphAccess::write))
+        return std::unexpected(
+            rhi::RenderError{.code = rhi::RenderErrorCode::command_submission_failed,
+                             .message = "Invalid GTAO resource declaration."});
+
       const auto taa = graph.add_pass(
           "temporal-aa", [this, command, frame_settings, current_jitter, history_write_index]() {
             MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -2838,7 +2972,7 @@ private:
               return std::expected<void, std::string>{
                   std::unexpected("could not create TAA resolve encoder")};
             [encoder setRenderPipelineState:taa_pipeline_];
-            [encoder setFragmentTexture:hdr_texture_ atIndex:0];
+            [encoder setFragmentTexture:gtao_hdr_texture_ atIndex:0];
             [encoder setFragmentTexture:velocity_texture_ atIndex:1];
             [encoder setFragmentTexture:depth_texture_ atIndex:2];
             [encoder setFragmentTexture:history_color_[history_read_index_] atIndex:3];
@@ -2867,7 +3001,7 @@ private:
             [encoder endEncoding];
             return std::expected<void, std::string>{};
           });
-      if (!graph.use(taa, hdr_resource, rhi::GraphAccess::read) ||
+      if (!graph.use(taa, gtao_hdr_resource, rhi::GraphAccess::read) ||
           !graph.use(taa, velocity_resource, rhi::GraphAccess::read) ||
           !graph.use(taa, reactive_resource, rhi::GraphAccess::read) ||
           !graph.use(taa, oit_accumulation_resource, rhi::GraphAccess::read) ||
@@ -2947,6 +3081,7 @@ private:
   __strong id<MTLRenderPipelineState> sky_pipeline_;
   __strong id<MTLRenderPipelineState> post_pipeline_;
   __strong id<MTLRenderPipelineState> taa_pipeline_;
+  __strong id<MTLRenderPipelineState> gtao_pipeline_;
   __strong id<MTLArgumentEncoder> scene_fragment_argument_encoder_;
   __strong id<MTLComputePipelineState> virtual_geometry_cull_pipeline_;
   __strong id<MTLComputePipelineState> virtual_geometry_encode_icb_pipeline_;
@@ -2977,6 +3112,8 @@ private:
   std::size_t instance_morph_scratch_cursor_{};
   std::array<__strong id<MTLTexture>, shadow_cascade_count> shadow_textures_;
   __strong id<MTLTexture> hdr_texture_;
+  __strong id<MTLTexture> indirect_diffuse_texture_;
+  __strong id<MTLTexture> gtao_hdr_texture_;
   __strong id<MTLTexture> velocity_texture_;
   __strong id<MTLTexture> reactive_texture_;
   __strong id<MTLTexture> oit_accumulation_texture_;

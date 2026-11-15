@@ -223,6 +223,11 @@ int main(int argc, char** argv) {
         astra::rhi::SceneSettings settings{};
         settings.time_seconds = time;
         settings.environment = environment.get();
+        const std::array<astra::rhi::PointLight, 1> point_lights{{
+            {.position = {std::sin(time * 0.55F) * 3.4F, 2.1F, 1.4F},
+             .range = 9.0F,
+             .intensity = {72.0F, 54.0F, 34.0F}}}};
+        settings.point_lights = point_lights;
         if (auto result = frame.render({0.025F, 0.035F, 0.055F, 1.0F}, settings); !result) {
             logger.log(astra::core::LogLevel::error, "Renderer", result.error().message);
             game.close();

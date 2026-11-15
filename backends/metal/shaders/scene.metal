@@ -37,7 +37,12 @@ struct SceneUniforms {
     float4 uv_transform[5]; // offset.xy, scale.xy
     float4 uv_rotation[5];  // cos(rotation), sin(rotation), reserved, reserved
     float4 environment_flags; // enabled, maximum prefilter mip, reserved, reserved
-    uint4 morph_flags; // target count, per-instance weights, vertex count, reserved
+    uint4 morph_flags; // target count, per-instance weights, vertex count, point-light count
+};
+
+struct PointLight {
+    float4 position_range;
+    float4 intensity;
 };
 
 struct MorphDelta {
@@ -656,6 +661,7 @@ struct SceneFragmentOut {
     float reactive [[color(2)]];
     float4 oit_accumulation [[color(3)]];
     float4 oit_revealage [[color(4)]];
+    float4 indirect_diffuse [[color(5)]];
 };
 
 fragment SceneFragmentOut astra_sky_fragment(FullscreenOut input [[stage_in]],
@@ -761,7 +767,8 @@ fragment SceneFragmentOut astra_sky_fragment(FullscreenOut input [[stage_in]],
             motion = mix(sky_motion, cloud_motion, cloud_coverage);
         }
     }
-    return SceneFragmentOut{float4(color, 1.0), motion, cloud_coverage, float4(0.0), float4(0.0)};
+    return SceneFragmentOut{float4(color, 1.0), motion, cloud_coverage, float4(0.0), float4(0.0),
+                            float4(0.0)};
 }
 
 float distribution_ggx(float n_dot_h, float roughness) {
@@ -844,6 +851,7 @@ struct SceneFragmentResources {
 fragment SceneFragmentOut astra_fragment(
     VertexOut input [[stage_in]], constant SceneUniforms &scene [[buffer(1)]],
     constant SceneFragmentResources &resources [[buffer(2)]],
+    constant PointLight *point_lights [[buffer(3)]],
     bool front_facing [[front_facing]]) {
     float2 base_color_uv = uint(scene.texcoord_sets0.x) == 0U ? input.texcoord0 : input.texcoord1;
     float2 metallic_roughness_uv =
@@ -921,6 +929,37 @@ fragment SceneFragmentOut astra_fragment(
     }
     float3 direct = (diffuse_weight * albedo / M_PI_F + specular) *
                     (scene.light_radiance.xyz * n_dot_l * visibility);
+
+    // Local emitters use radiometric intensity (W/sr for meter-sized world units), inverse-square
+    // attenuation, and a smooth finite-range cutoff. They do not inherit the
+    // directional sun's cascaded shadow visibility.
+    const uint point_light_count = min(scene.morph_flags.w, 32U);
+    for (uint light_index = 0U; light_index < point_light_count; ++light_index) {
+        const PointLight light = point_lights[light_index];
+        const float3 to_light = light.position_range.xyz - input.world_position;
+        const float distance_squared = max(dot(to_light, to_light), 1.0e-4);
+        const float distance_to_light = sqrt(distance_squared);
+        const float range = light.position_range.w;
+        if (distance_to_light >= range)
+            continue;
+        const float3 local_l = to_light / distance_to_light;
+        const float3 local_h = normalize(v + local_l);
+        const float local_n_dot_l = max(dot(n, local_l), 0.0);
+        if (local_n_dot_l <= 0.0)
+            continue;
+        const float local_n_dot_h = max(dot(n, local_h), 0.0);
+        const float local_h_dot_v = max(dot(local_h, v), 0.0);
+        const float3 local_fresnel = fresnel_schlick(local_h_dot_v, f0);
+        const float local_distribution = distribution_ggx(local_n_dot_h, roughness);
+        const float local_geometry = geometry_schlick(n_dot_v, roughness) *
+                                     geometry_schlick(local_n_dot_l, roughness);
+        const float3 local_specular = local_distribution * local_geometry * local_fresnel /
+            max(4.0 * n_dot_v * max(local_n_dot_l, 0.001), 0.001);
+        const float range_fade = 1.0 - smoothstep(range * 0.8, range, distance_to_light);
+        const float3 irradiance = light.intensity.xyz * (range_fade * range_fade / distance_squared);
+        const float3 local_diffuse_weight = (1.0 - local_fresnel) * (1.0 - metallic);
+        direct += (local_diffuse_weight * albedo / M_PI_F + local_specular) * irradiance * local_n_dot_l;
+    }
 
     float3 sun_direction = normalize(-scene.light_direction.xyz);
     float3 reflected_direction = reflect(-v, n);
@@ -1007,7 +1046,98 @@ fragment SceneFragmentOut astra_fragment(
     const float4 oit_accumulation = float4(color * alpha, alpha) * oit_weight;
     const float4 oit_revealage = float4(alpha);
     return SceneFragmentOut{float4(color, alpha), motion, reactive,
-                            oit_accumulation, oit_revealage};
+                            oit_accumulation, oit_revealage,
+                            float4(ambient_diffuse * fog_transmittance, 0.0)};
+}
+
+struct GtaoUniforms {
+    float4x4 inverse_view_projection;
+    float4 camera_position;
+    float4 parameters; // radius in world units, strength, bias, reserved
+    float4 jitter; // current NDC projection jitter xy
+};
+
+float3 gtao_reconstruct_world(depth2d<float> depth_texture, uint2 pixel,
+                              uint2 dimensions, constant GtaoUniforms &uniforms) {
+    const float depth = depth_texture.read(pixel);
+    const float2 uv = (float2(pixel) + 0.5) / float2(dimensions);
+    const float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0) - uniforms.jitter.xy;
+    const float4 world_h = uniforms.inverse_view_projection * float4(ndc, depth, 1.0);
+    return world_h.xyz / max(abs(world_h.w), 1.0e-6) * sign(world_h.w);
+}
+
+fragment float4 astra_gtao_composite_fragment(
+    FullscreenOut input [[stage_in]], texture2d<float> hdr_color [[texture(0)]],
+    texture2d<float> indirect_diffuse [[texture(1)]], depth2d<float> scene_depth [[texture(2)]],
+    constant GtaoUniforms &uniforms [[buffer(0)]]) {
+    const uint2 dimensions = uint2(scene_depth.get_width(), scene_depth.get_height());
+    const uint2 pixel = min(uint2(input.position.xy), dimensions - 1U);
+    const float3 hdr = hdr_color.read(pixel).rgb;
+    const float3 indirect = indirect_diffuse.read(pixel).rgb;
+    const float center_depth = scene_depth.read(pixel);
+    if (center_depth >= 0.999999 || uniforms.parameters.x <= 0.0)
+        return float4(hdr, 1.0);
+
+    const float3 center = gtao_reconstruct_world(scene_depth, pixel, dimensions, uniforms);
+    const uint2 x_before = uint2(pixel.x > 0U ? pixel.x - 1U : pixel.x, pixel.y);
+    const uint2 x_after = uint2(min(pixel.x + 1U, dimensions.x - 1U), pixel.y);
+    const uint2 y_before = uint2(pixel.x, pixel.y > 0U ? pixel.y - 1U : pixel.y);
+    const uint2 y_after = uint2(pixel.x, min(pixel.y + 1U, dimensions.y - 1U));
+    const float x_before_depth = scene_depth.read(x_before);
+    const float x_after_depth = scene_depth.read(x_after);
+    const float y_before_depth = scene_depth.read(y_before);
+    const float y_after_depth = scene_depth.read(y_after);
+    const uint2 x_sample = x_before_depth < 0.999999 &&
+                                   (x_after_depth >= 0.999999 ||
+                                    abs(x_before_depth - center_depth) < abs(x_after_depth - center_depth))
+                               ? x_before : x_after;
+    const uint2 y_sample = y_before_depth < 0.999999 &&
+                                   (y_after_depth >= 0.999999 ||
+                                    abs(y_before_depth - center_depth) < abs(y_after_depth - center_depth))
+                               ? y_before : y_after;
+    const float3 dx = gtao_reconstruct_world(scene_depth, x_sample, dimensions, uniforms) - center;
+    const float3 dy = gtao_reconstruct_world(scene_depth, y_sample, dimensions, uniforms) - center;
+    const float3 normal_cross = cross(dx, dy);
+    float3 normal = dot(normal_cross, normal_cross) > 1.0e-8
+                        ? normalize(normal_cross)
+                        : normalize(uniforms.camera_position.xyz - center);
+    if (dot(normal, uniforms.camera_position.xyz - center) < 0.0)
+        normal = -normal;
+
+    constexpr uint direction_count = 8U;
+    constexpr uint steps_per_direction = 6U;
+    constexpr float two_pi = 6.28318530718;
+    float occlusion = 0.0;
+    const float radius = uniforms.parameters.x;
+    // Projection-independent 60-degree perspective approximation, capped to
+    // keep the bounded screen-space search local at very close distances.
+    const float pixel_radius = min(radius * 0.8660254 * float(dimensions.y) /
+                                       max(length(center - uniforms.camera_position.xyz), 0.01),
+                                   64.0);
+    for (uint direction_index = 0U; direction_index < direction_count; ++direction_index) {
+        const float angle = (float(direction_index) + 0.5) * (two_pi / float(direction_count));
+        const float2 direction = float2(cos(angle), sin(angle));
+        float horizon = -1.0;
+        for (uint step = 1U; step <= steps_per_direction; ++step) {
+            const float fraction = float(step) / float(steps_per_direction);
+            const int2 offset = int2(round(direction * fraction * pixel_radius));
+            const int2 sample_position = clamp(int2(pixel) + offset, int2(0), int2(dimensions) - 1);
+            const uint2 sample_pixel = uint2(sample_position);
+            if (scene_depth.read(sample_pixel) >= 0.999999)
+                continue;
+            const float3 delta = gtao_reconstruct_world(scene_depth, sample_pixel, dimensions, uniforms) - center;
+            const float distance_to_sample = length(delta);
+            if (distance_to_sample <= 1.0e-4 || distance_to_sample >= radius)
+                continue;
+            const float elevation = dot(normal, delta / distance_to_sample) - uniforms.parameters.z;
+            const float range_weight = 1.0 - smoothstep(radius * 0.65, radius, distance_to_sample);
+            horizon = max(horizon, elevation * range_weight);
+        }
+        occlusion += max(horizon, 0.0);
+    }
+    const float ao = clamp(1.0 - uniforms.parameters.y * occlusion / float(direction_count), 0.0, 1.0);
+    const float3 indirect_after_ao = indirect * ao;
+    return float4(hdr - indirect + indirect_after_ao, 1.0);
 }
 
 struct TaaFragmentOut {
