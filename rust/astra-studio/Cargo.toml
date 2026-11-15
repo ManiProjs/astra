@@ -12,3 +12,13 @@ path = "src/main.rs"
 gpui = { version = "0.2.2", default-features = false, features = ["font-kit"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[package.metadata.bundle]
+name = "Astra Studio"
+identifier = "dev.astra.studio"
+icon = ["icons/32x32.png", "icons/128x128.png", "icons/256x256.png", "icons/astra-studio.icns", "icons/astra-studio.ico"]
+resources = ["splash.png"]
+category = "DeveloperTool"
+short_description = "Native editor for the Astra game engine"
+long_description = "A native desktop workspace for editing Astra projects, building examples, and managing scenes."
+osx_minimum_system_version = "13.0"

@@ -12,6 +12,15 @@
 int main() {
     using namespace astra::rhi;
 
+    assert(backend_name(Backend::automatic) == std::string{"Automatic"});
+    assert(backend_name(Backend::direct3d9) == std::string{"Direct3D 9"});
+    assert(backend_name(Backend::direct3d10) == std::string{"Direct3D 10"});
+    assert(backend_name(Backend::direct3d11) == std::string{"Direct3D 11"});
+    assert(backend_name(Backend::direct3d12) == std::string{"Direct3D 12"});
+    assert(backend_name(Backend::vulkan) == std::string{"Vulkan"});
+    assert(backend_name(Backend::opengl) == std::string{"OpenGL"});
+    assert(backend_name(Backend::metal) == std::string{"Metal"});
+
     static_assert(std::is_aggregate_v<DrawItem>);
     static_assert(std::is_aggregate_v<SceneSettings>);
     // Preserve the pre-temporal positional aggregate prefixes.

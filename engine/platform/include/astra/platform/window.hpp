@@ -20,12 +20,19 @@ struct WindowError final {
     std::string message;
 };
 
+// GLFW must know whether a window will own an OpenGL context or be used as a
+// Vulkan presentation surface before the native window is created. AppKit
+// always exposes its CAMetalLayer, which can be consumed by Metal or Vulkan.
+enum class WindowClientAPI : unsigned char { opengl, vulkan };
+
 struct WindowConfig final {
     std::string title{"Astra Window"};
     std::uint32_t width{1280};
     std::uint32_t height{720};
     bool resizable{true};
     bool high_dpi{true};
+    WindowClientAPI client_api{WindowClientAPI::opengl};
+    bool visible{true};
 };
 
 enum class WindowEventType : unsigned char {

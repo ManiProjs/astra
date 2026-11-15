@@ -21,6 +21,18 @@ clusters.
 The RHI still contains an older `RenderDevice` path alongside a newer low-level
 `Device` contract, and Metal implements only the former.
 
+The GLFW/OpenGL backend is an initial clear-and-present path for Windows and Linux. It creates a
+real OpenGL context and presents the default framebuffer; mesh, texture, environment, and non-empty
+scene rendering are explicitly unsupported until their RHI implementations are ported.
+
+The Vulkan backend is a separate clear-and-present implementation of the live `RenderDevice`
+contract. It creates the instance/device/queue/surface/swapchain/render pass/command buffers and
+synchronization objects, then clears and presents. GLFW Win/Linux windows must be created with
+`WindowClientAPI::vulkan`; macOS uses the AppKit CAMetalLayer through `VK_EXT_metal_surface` when
+MoltenVK exposes that extension. Mesh, texture, virtual-geometry, environment, and scene drawing
+are explicitly unsupported. CMake builds this backend only when `find_package(Vulkan)` succeeds
+and the platform surface adapter is available.
+
 The current renderer is an experimental vertical slice. It does not yet provide
 prefiltered HDR image-based lighting, GPU-generated multi-draw command buffers,
 GPU-driven world streaming, a production resource cache, a general material

@@ -3,6 +3,12 @@
 #if defined(ASTRA_HAS_METAL)
 #include <astra/metal/metal_device.hpp>
 #endif
+#if defined(ASTRA_HAS_OPENGL)
+#include <astra/opengl/opengl_device.hpp>
+#endif
+#if defined(ASTRA_HAS_VULKAN)
+#include <astra/vulkan/vulkan_device.hpp>
+#endif
 
 #include <utility>
 
@@ -28,6 +34,8 @@ std::expected<Renderer, rhi::RenderError> Renderer::create(platform::Window& win
     case rhi::Backend::automatic:
 #if defined(ASTRA_HAS_METAL)
         config.backend = rhi::Backend::metal;
+#elif defined(ASTRA_HAS_OPENGL)
+        config.backend = rhi::Backend::opengl;
 #else
         return std::unexpected(rhi::RenderError{
             .code = rhi::RenderErrorCode::unsupported_backend,
@@ -49,16 +57,57 @@ std::expected<Renderer, rhi::RenderError> Renderer::create(platform::Window& win
             .message = "The Metal backend is only built on Apple platforms.",
         });
 #endif
-    case rhi::Backend::vulkan:
-        return std::unexpected(rhi::RenderError{
-            .code = rhi::RenderErrorCode::unsupported_backend,
-            .message = "The Vulkan backend has not been implemented yet.",
-        });
+    case rhi::Backend::direct3d9:
+    case rhi::Backend::direct3d10:
+    case rhi::Backend::direct3d11:
     case rhi::Backend::direct3d12:
         return std::unexpected(rhi::RenderError{
             .code = rhi::RenderErrorCode::unsupported_backend,
-            .message = "The Direct3D 12 backend has not been implemented yet.",
+            .message = std::string{rhi::backend_name(config.backend)} +
+                       " is not available in this build yet.",
         });
+    case rhi::Backend::opengl:
+#if defined(ASTRA_HAS_OPENGL)
+#if defined(ASTRA_HAS_GLFW)
+        if (window.config().client_api != platform::WindowClientAPI::opengl)
+            return std::unexpected(rhi::RenderError{
+                .code = rhi::RenderErrorCode::invalid_surface,
+                .message = "OpenGL requires a GLFW window created with WindowClientAPI::opengl.",
+            });
+#endif
+        if (auto device =
+                astra::opengl::create_opengl_render_device(window.native_render_surface())) {
+            return Renderer{std::move(*device)};
+        } else {
+            return std::unexpected(device.error());
+        }
+#else
+        return std::unexpected(rhi::RenderError{
+            .code = rhi::RenderErrorCode::unsupported_backend,
+            .message = "OpenGL is not available in this build.",
+        });
+#endif
+    case rhi::Backend::vulkan:
+#if defined(ASTRA_HAS_VULKAN)
+#if defined(ASTRA_HAS_GLFW)
+        if (window.config().client_api != platform::WindowClientAPI::vulkan)
+            return std::unexpected(rhi::RenderError{
+                .code = rhi::RenderErrorCode::invalid_surface,
+                .message = "Vulkan requires a GLFW window created with WindowClientAPI::vulkan (no client API).",
+            });
+#endif
+        if (auto device =
+                astra::vulkan::create_vulkan_render_device(window.native_render_surface())) {
+            return Renderer{std::move(*device)};
+        } else {
+            return std::unexpected(device.error());
+        }
+#else
+        return std::unexpected(rhi::RenderError{
+            .code = rhi::RenderErrorCode::unsupported_backend,
+            .message = "Vulkan is not available in this build (Vulkan SDK/loader or native WSI support missing).",
+        });
+#endif
     }
 
     return std::unexpected(rhi::RenderError{

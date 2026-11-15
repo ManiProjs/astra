@@ -22,7 +22,7 @@ int main() {
     });
     worker.join();
 
-#if defined(__APPLE__) && !defined(ASTRA_TEST_UNSUPPORTED_BACKEND)
+#if (defined(__APPLE__) && !defined(ASTRA_TEST_UNSUPPORTED_BACKEND)) || defined(ASTRA_TEST_GLFW)
     if (worker_created_window ||
         worker_error != astra::platform::WindowErrorCode::not_main_thread) {
         return 1;
@@ -43,7 +43,7 @@ int main() {
         return 1;
     }
 
-#if defined(__APPLE__) && !defined(ASTRA_TEST_UNSUPPORTED_BACKEND)
+#if (defined(__APPLE__) && !defined(ASTRA_TEST_UNSUPPORTED_BACKEND)) || defined(ASTRA_TEST_GLFW)
     return result.error().code == astra::platform::WindowErrorCode::creation_failed ? 0 : 1;
 #else
     if (result.error().code != astra::platform::WindowErrorCode::unsupported_platform)

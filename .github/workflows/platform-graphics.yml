@@ -1,0 +1,97 @@
+name: Platform and graphics builds
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / Clang
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+          - os: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Windows build dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install llvm ninja -y --no-progress
+          $llvmBin = Join-Path $env:ProgramFiles 'LLVM\bin'
+          if (Test-Path "$llvmBin\clang-cl.exe") {
+            $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+          $vcpkgRoot = if ($env:VCPKG_INSTALLATION_ROOT) { $env:VCPKG_INSTALLATION_ROOT } else { 'C:\vcpkg' }
+          if (-not (Test-Path "$vcpkgRoot\vcpkg.exe")) {
+            git clone https://github.com/microsoft/vcpkg.git $vcpkgRoot
+            & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+          }
+          & "$vcpkgRoot\vcpkg.exe" install glfw3:x64-windows vulkan:x64-windows
+          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Verify Windows LLVM toolchain
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: clang-cl --version
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang ninja-build libglfw3-dev libgl1-mesa-dev \
+            libvulkan-dev mesa-vulkan-drivers xvfb
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          cmake -S . -B build-ci -G Ninja
+          -DCMAKE_CXX_COMPILER=clang-cl
+          -DCMAKE_CXX_COMPILER_TARGET=x86_64-pc-windows-msvc
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-windows
+          -DASTRA_BUILD_STUDIO=OFF
+          -DASTRA_BUILD_EXAMPLES=OFF
+          -DASTRA_ENABLE_PHYSICS=OFF
+          -DASTRA_ENABLE_VULKAN=ON
+          -DBUILD_TESTING=ON
+
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: >-
+          cmake -S . -B build-ci -G Ninja
+          -DCMAKE_CXX_COMPILER=clang++
+          -DASTRA_BUILD_STUDIO=OFF
+          -DASTRA_BUILD_EXAMPLES=OFF
+          -DASTRA_ENABLE_PHYSICS=OFF
+          -DASTRA_ENABLE_VULKAN=ON
+          -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build build-ci --parallel 2
+
+      - name: Run CTest (Windows)
+        if: runner.os == 'Windows'
+        run: ctest --test-dir build-ci --output-on-failure
+
+      - name: Run CTest (Linux, virtual display)
+        if: runner.os == 'Linux'
+        run: xvfb-run --auto-servernum ctest --test-dir build-ci --output-on-failure

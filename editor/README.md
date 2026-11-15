@@ -5,6 +5,13 @@ It is intentionally a project workspace rather than a web-style marketing dashbo
 
 ## Current workflows
 
+- Startup presents a short Astra Studio splash, then opens the Home page (with Learn available
+  when the optional learning component is installed).
+- Home provides a Continue Working action for the current workspace and a native folder picker
+  for opening another project directory.
+- Learn is supplied by the optional Astra Learning component. When installed, it lists the
+  component's examples and guides, with source-opening and (when a configured engine build is
+  available) per-example CMake build actions.
 - Project explorer indexes actual source, shader, model, image, Blender, and project files.
 - Source view opens and edits text project files in place; use the keyboard to edit and `⌘S` to save.
 - Open dispatches source documents to the built-in source view, `.blend` files to Blender, and
@@ -25,8 +32,18 @@ From the repository root:
 cargo run -p astra-studio
 ```
 
-The Build action expects a configured `build/` CMake directory. Configure it from the repository
-root with `cmake -S . -B build -DASTRA_BUILD_EXAMPLES=ON` if needed.
+The Learn page is not compiled into or required by the editor. It discovers an independently
+installed learning component through `ASTRA_LEARNING_COMPONENT_DIR`, the development checkout's
+`learning/` directory, or the editor's adjacent `share/astra/learning` install location. Without
+that component, the Learn navigation and Home shortcut are omitted.
+
+For a development checkout, the component manifest is `learning/manifest.json`. For an installed
+SDK, configure with `-DASTRA_INSTALL_LEARNING_COMPONENT=ON`, then install it separately with
+`cmake --install build --component AstraLearning`. The content component contains example sources
+and learning guides; it does not add dependencies to the core editor package. Example builds
+additionally require an engine checkout/build configured with `-DASTRA_BUILD_EXAMPLES=ON` (and
+`ASTRA_ENABLE_PHYSICS=ON` for the physics sample). Set `ASTRA_ENGINE_SOURCE_DIR` if the engine
+checkout is not the current project.
 
 ## Honest integration boundaries
 

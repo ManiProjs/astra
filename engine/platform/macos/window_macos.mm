@@ -188,9 +188,11 @@ std::expected<Window, WindowError> Window::create(WindowConfig config) {
     impl->window.delegate = impl->delegate;
 
     [impl->window center];
-    [impl->window makeKeyAndOrderFront:nil];
-    [impl->window makeFirstResponder:impl->view];
-    [NSApp activateIgnoringOtherApps:YES];
+    if (impl->config.visible) {
+      [impl->window makeKeyAndOrderFront:nil];
+      [impl->window makeFirstResponder:impl->view];
+      [NSApp activateIgnoringOtherApps:YES];
+    }
     [impl->view updateDrawableSize];
 
     const CGFloat scale =

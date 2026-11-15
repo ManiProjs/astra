@@ -6,7 +6,32 @@
 
 namespace astra::rhi {
 
-enum class Backend : std::uint8_t { automatic, metal, vulkan, direct3d12 };
+// Keep API generations distinct: projects can pin a backend explicitly while
+// `automatic` remains free to choose the best compiled implementation.
+enum class Backend : std::uint8_t {
+    automatic,
+    direct3d9,
+    direct3d10,
+    direct3d11,
+    direct3d12,
+    vulkan,
+    opengl,
+    metal,
+};
+
+[[nodiscard]] constexpr const char* backend_name(Backend backend) noexcept {
+    switch (backend) {
+    case Backend::automatic: return "Automatic";
+    case Backend::direct3d9: return "Direct3D 9";
+    case Backend::direct3d10: return "Direct3D 10";
+    case Backend::direct3d11: return "Direct3D 11";
+    case Backend::direct3d12: return "Direct3D 12";
+    case Backend::vulkan: return "Vulkan";
+    case Backend::opengl: return "OpenGL";
+    case Backend::metal: return "Metal";
+    }
+    return "Unknown";
+}
 
 struct Extent2D final {
     std::uint32_t width{};
