@@ -24,7 +24,76 @@ int main() {
     assert(legacy_settings.previous_camera_position.x == 0.0F);
     assert(legacy_settings.previous_camera_position.y == 0.0F);
     assert(legacy_settings.previous_camera_position.z == 0.0F);
+    assert(validate_scene_lighting(SceneSettings{}));
+    auto invalid_lighting = SceneSettings{};
+    invalid_lighting.directional_light_radiance = {1.0F, -0.1F, 1.0F};
+    assert(!validate_scene_lighting(invalid_lighting));
+    invalid_lighting = SceneSettings{};
+    invalid_lighting.light_direction = {};
+    assert(!validate_scene_lighting(invalid_lighting));
     assert(validate_volumetric_clouds(VolumetricCloudSettings{}));
+    const std::array<Vec3, 3> morph_positions{{{0.0F, 0.0F, 0.1F},
+                                               {0.0F, 0.0F, 0.1F},
+                                               {0.0F, 0.0F, 0.1F}}};
+    const std::array<Vec3, 3> morph_normals{{{0.0F, 0.1F, 0.0F},
+                                             {0.0F, 0.1F, 0.0F},
+                                             {0.0F, 0.1F, 0.0F}}};
+    const std::array<MeshData::MorphTarget, 2> morph_targets{{
+        {.positions = morph_positions},
+        {.normals = morph_normals},
+    }};
+    assert(validate_morph_targets(3, morph_targets));
+    const std::array<MeshData::MorphTarget, 1> missing_attributes{{{}}};
+    assert(!validate_morph_targets(3, missing_attributes));
+    const std::array<Vec3, 2> wrong_morph_count{};
+    const std::array<MeshData::MorphTarget, 1> wrong_morph{{{.positions = wrong_morph_count}}};
+    assert(!validate_morph_targets(3, wrong_morph));
+    const std::array<Vec3, 1> non_finite_morph{{{NAN, 0.0F, 0.0F}}};
+    const std::array<MeshData::MorphTarget, 1> invalid_morph{{{.positions = non_finite_morph}}};
+    assert(!validate_morph_targets(1, invalid_morph));
+    const std::vector<MeshData::MorphTarget> too_many_morphs(257);
+    assert(!validate_morph_targets(3, too_many_morphs));
+    assert(!validate_morph_targets(0, morph_targets));
+    const std::array<float, 2> morph_target_radii{1.0F, 3.0F};
+    const std::array<float, 2> morph_weights{0.5F, -2.0F};
+    assert(std::abs(morph_displacement_bound(morph_target_radii, morph_weights) - 6.5F) < 1.0e-5F);
+    assert(std::isinf(morph_displacement_bound(morph_target_radii,
+                                                std::span<const float>{morph_weights.data(), 1})));
+    const std::array<float, 2> non_finite_weights{0.5F, NAN};
+    assert(!morph_weights_are_finite(non_finite_weights));
+    assert(std::isinf(morph_displacement_bound(morph_target_radii, non_finite_weights)));
+    const std::array<float, 2> invalid_target_radii{
+        1.0F, std::numeric_limits<float>::infinity()};
+    const std::array<float, 2> zero_morph_weights{0.0F, 0.0F};
+    assert(std::isinf(morph_displacement_bound(invalid_target_radii, zero_morph_weights)));
+    const std::array<float, 6> instance_current{0.1F, 0.2F, 0.3F, 0.4F, 0.5F, 0.6F};
+    const std::array<float, 6> instance_previous{0.0F, 0.1F, 0.2F, 0.3F, 0.4F, 0.5F};
+    const std::array<std::uint32_t, 2> visible_instances{2U, 0U};
+    std::vector<float> compacted_current;
+    std::vector<float> compacted_previous;
+    assert(compact_instance_morph_weights(instance_current, instance_previous,
+                                          visible_instances, 2, compacted_current,
+                                          &compacted_previous));
+    assert((compacted_current == std::vector<float>{0.5F, 0.6F, 0.1F, 0.2F}));
+    assert((compacted_previous == std::vector<float>{0.4F, 0.5F, 0.0F, 0.1F}));
+    compacted_current.clear();
+    assert(compact_instance_morph_weights(instance_current, {}, visible_instances, 2,
+                                          compacted_current));
+    assert((compacted_current == std::vector<float>{0.5F, 0.6F, 0.1F, 0.2F}));
+    const std::array<std::uint32_t, 1> invalid_visible_instance{3U};
+    assert(!compact_instance_morph_weights(instance_current, {}, invalid_visible_instance,
+                                           2, compacted_current));
+    const auto previous_if_valid = previous_frame_span(
+        std::span<const float>{instance_current.data(), 2},
+        std::span<const float>{instance_previous.data(), 2}, true);
+    const auto current_if_invalid = previous_frame_span(
+        std::span<const float>{instance_current.data(), 2},
+        std::span<const float>{instance_previous.data(), 2}, false);
+    assert(previous_if_valid.data() == instance_previous.data());
+    assert(current_if_invalid.data() == instance_current.data());
+    const auto current_if_missing = previous_frame_span(
+        std::span<const float>{instance_current.data(), 2}, {}, true);
+    assert(current_if_missing.data() == instance_current.data());
     auto invalid_clouds = VolumetricCloudSettings{};
     invalid_clouds.top_altitude = invalid_clouds.base_altitude;
     assert(!validate_volumetric_clouds(invalid_clouds));

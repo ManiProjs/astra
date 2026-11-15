@@ -1,19 +1,23 @@
+#include <astra/assets/animation.hpp>
 #include <astra/assets/gltf.hpp>
 #include <astra/assets/image.hpp>
 #include <astra/core/log.hpp>
 #include <astra/game/game.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <numbers>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
 #ifndef ASTRA_BOAR_ASSET_PATH
-#define ASTRA_BOAR_ASSET_PATH "assets/characters/Boarbound.glb"
+#define ASTRA_BOAR_ASSET_PATH "assets/characters/AstraBoar.glb"
 #endif
 #ifndef ASTRA_BOAR_HUMAN_ASSET_PATH
 #define ASTRA_BOAR_HUMAN_ASSET_PATH "assets/characters/Boarbound-Human.glb"
@@ -32,11 +36,15 @@ using astra::rhi::Vec4;
 struct Part final {
     std::unique_ptr<astra::rhi::GpuMesh> mesh;
     MaterialData material;
+    std::vector<float> morph_weights;
+    std::uint32_t node{};
+    std::uint32_t skin{~std::uint32_t{0}};
 };
 
 struct Character final {
     std::vector<std::unique_ptr<astra::rhi::GpuTexture>> textures;
     std::vector<Part> parts;
+    std::unique_ptr<Asset> source;
 };
 
 struct Transform final {
@@ -45,70 +53,35 @@ struct Transform final {
     Vec3 scale{1.0F, 1.0F, 1.0F};
 };
 
-Vec4 multiply(Vec4 a, Vec4 b) {
-    return {
-        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
-        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
-    };
+Matrix4 transform_matrix(const Transform& transform) {
+    const auto q = transform.rotation;
+    const float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
+    const float xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z;
+    const float wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z;
+    Matrix4 result{};
+    result.values[0] = (1.0F - 2.0F * (yy + zz)) * transform.scale.x;
+    result.values[1] = (2.0F * (xy + wz)) * transform.scale.x;
+    result.values[2] = (2.0F * (xz - wy)) * transform.scale.x;
+    result.values[4] = (2.0F * (xy - wz)) * transform.scale.y;
+    result.values[5] = (1.0F - 2.0F * (xx + zz)) * transform.scale.y;
+    result.values[6] = (2.0F * (yz + wx)) * transform.scale.y;
+    result.values[8] = (2.0F * (xz + wy)) * transform.scale.z;
+    result.values[9] = (2.0F * (yz - wx)) * transform.scale.z;
+    result.values[10] = (1.0F - 2.0F * (xx + yy)) * transform.scale.z;
+    result.values[12] = transform.translation.x;
+    result.values[13] = transform.translation.y;
+    result.values[14] = transform.translation.z;
+    result.values[15] = 1.0F;
+    return result;
 }
 
-Vec3 rotate(Vec3 value, Vec4 q) {
-    const Vec3 u{q.x, q.y, q.z};
-    const Vec3 cross1{u.y * value.z - u.z * value.y,
-                      u.z * value.x - u.x * value.z,
-                      u.x * value.y - u.y * value.x};
-    const Vec3 cross2{u.y * cross1.z - u.z * cross1.y,
-                      u.z * cross1.x - u.x * cross1.z,
-                      u.x * cross1.y - u.y * cross1.x};
-    return {value.x + 2.0F * (q.w * cross1.x + cross2.x),
-            value.y + 2.0F * (q.w * cross1.y + cross2.y),
-            value.z + 2.0F * (q.w * cross1.z + cross2.z)};
-}
-
-Transform world_transform(const Asset& asset, std::size_t index, std::vector<Transform>& cache,
-                          std::vector<bool>& ready) {
-    if (ready[index])
-        return cache[index];
-    const auto& node = asset.nodes[index];
-    Transform local{{node.translation.x, node.translation.y, node.translation.z},
-                    {node.rotation.x, node.rotation.y, node.rotation.z, node.rotation.w},
-                    {node.scale.x, node.scale.y, node.scale.z}};
-    if (node.parent >= 0) {
-        const auto parent = world_transform(asset, static_cast<std::size_t>(node.parent), cache, ready);
-        const auto translated = rotate({parent.scale.x * local.translation.x,
-                                        parent.scale.y * local.translation.y,
-                                        parent.scale.z * local.translation.z}, parent.rotation);
-        local.translation = {parent.translation.x + translated.x,
-                             parent.translation.y + translated.y,
-                             parent.translation.z + translated.z};
-        local.rotation = multiply(parent.rotation, local.rotation);
-        local.scale = {parent.scale.x * local.scale.x, parent.scale.y * local.scale.y,
-                       parent.scale.z * local.scale.z};
-    }
-    cache[index] = local;
-    ready[index] = true;
-    return local;
-}
-
-Vec3 transform_position(Vec3 position, const Transform& transform) {
-    const auto rotated = rotate({position.x * transform.scale.x,
-                                 position.y * transform.scale.y,
-                                 position.z * transform.scale.z}, transform.rotation);
-    return {transform.translation.x + rotated.x, transform.translation.y + rotated.y,
-            transform.translation.z + rotated.z};
-}
-
-Vec3 transform_normal(Vec3 normal, const Transform& transform) {
-    Vec3 result = rotate({normal.x / transform.scale.x, normal.y / transform.scale.y,
-                          normal.z / transform.scale.z}, transform.rotation);
-    const float length = std::sqrt(result.x * result.x + result.y * result.y + result.z * result.z);
-    if (length > 1.0e-6F) {
-        result.x /= length;
-        result.y /= length;
-        result.z /= length;
-    }
+Matrix4 multiply_matrix(const Matrix4& a, const Matrix4& b) {
+    Matrix4 result{};
+    for (std::size_t column = 0; column < 4; ++column)
+        for (std::size_t row = 0; row < 4; ++row)
+            for (std::size_t k = 0; k < 4; ++k)
+                result.values[column * 4 + row] +=
+                    a.values[k * 4 + row] * b.values[column * 4 + k];
     return result;
 }
 
@@ -208,13 +181,10 @@ std::expected<Character, std::string> load_character(astra::renderer::Renderer& 
         materials.push_back(material);
     }
 
-    std::vector<Transform> transforms(asset.nodes.size());
-    std::vector<bool> transform_ready(asset.nodes.size(), false);
     for (std::size_t node_index = 0; node_index < asset.nodes.size(); ++node_index) {
         const auto& node = asset.nodes[node_index];
         if (node.mesh >= asset.meshes.size())
             continue;
-        const auto node_transform = world_transform(asset, node_index, transforms, transform_ready);
         const auto& mesh = asset.meshes[node.mesh];
         for (const auto& primitive : mesh.primitives) {
             if (primitive.mode != 4U || primitive.vertices.empty() || primitive.indices.empty())
@@ -223,10 +193,8 @@ std::expected<Character, std::string> load_character(astra::renderer::Renderer& 
             vertices.reserve(primitive.vertices.size());
             for (const auto& source : primitive.vertices) {
                 MeshVertex vertex{};
-                vertex.position = transform_position(
-                    {source.position.x, source.position.y, source.position.z}, node_transform);
-                vertex.normal = transform_normal(
-                    {source.normal.x, source.normal.y, source.normal.z}, node_transform);
+                vertex.position = {source.position.x, source.position.y, source.position.z};
+                vertex.normal = {source.normal.x, source.normal.y, source.normal.z};
                 vertex.color = {source.color.x, source.color.y, source.color.z, source.color.w};
                 vertex.texcoord_u = source.texcoord0.x;
                 vertex.texcoord_v = source.texcoord0.y;
@@ -244,21 +212,47 @@ std::expected<Character, std::string> load_character(astra::renderer::Renderer& 
                 }
                 vertices.push_back(vertex);
             }
-            auto gpu_mesh = renderer.create_mesh({vertices, primitive.indices});
+            std::vector<std::vector<Vec3>> morph_positions;
+            std::vector<std::vector<Vec3>> morph_normals;
+            std::vector<std::vector<Vec3>> morph_tangents;
+            std::vector<astra::rhi::MeshData::MorphTarget> morph_targets;
+            morph_positions.reserve(primitive.morph_targets.size());
+            morph_normals.reserve(primitive.morph_targets.size());
+            morph_tangents.reserve(primitive.morph_targets.size());
+            morph_targets.reserve(primitive.morph_targets.size());
+            const auto convert_deltas = [](const std::vector<astra::assets::Vec3>& source,
+                                           std::vector<Vec3>& destination) {
+                destination.reserve(source.size());
+                for (const auto& value : source)
+                    destination.push_back({value.x, value.y, value.z});
+            };
+            for (const auto& source_target : primitive.morph_targets) {
+                morph_positions.emplace_back();
+                morph_normals.emplace_back();
+                morph_tangents.emplace_back();
+                convert_deltas(source_target.positions, morph_positions.back());
+                convert_deltas(source_target.normals, morph_normals.back());
+                convert_deltas(source_target.tangents, morph_tangents.back());
+                morph_targets.push_back({morph_positions.back(), morph_normals.back(),
+                                         morph_tangents.back()});
+            }
+            auto gpu_mesh = renderer.create_mesh({vertices, primitive.indices, morph_targets});
             if (!gpu_mesh)
                 return std::unexpected("Could not upload " + mesh.name + ": " + gpu_mesh.error().message);
             MaterialData material;
             if (primitive.material < materials.size())
                 material = materials[primitive.material];
-            character.parts.push_back({std::move(*gpu_mesh), material});
+            character.parts.push_back({std::move(*gpu_mesh), material, node.weights,
+                                       static_cast<std::uint32_t>(node_index), node.skin});
         }
     }
     if (character.parts.empty())
         return std::unexpected("The character asset contains no renderable triangle meshes: " + path.string());
+    character.source = std::make_unique<Asset>(std::move(asset));
     return character;
 }
 
-Matrix4 model_transform(float scale, float yaw, float bob) {
+Matrix4 model_transform(float scale, float yaw, float offset_x) {
     Matrix4 result{};
     const float c = std::cos(yaw), s = std::sin(yaw);
     result.values[0] = c * scale;
@@ -266,24 +260,201 @@ Matrix4 model_transform(float scale, float yaw, float bob) {
     result.values[5] = scale;
     result.values[8] = s * scale;
     result.values[10] = c * scale;
-    result.values[12] = 0.0F;
-    result.values[13] = bob;
+    result.values[12] = offset_x;
+    result.values[13] = 0.0F;
     result.values[14] = 0.0F;
     result.values[15] = 1.0F;
     return result;
 }
 
-void draw_character(astra::game::Frame& frame, const Character& character, float opacity,
-                    Matrix4 transform) {
-    if (opacity <= 0.005F)
-        return;
-    for (const auto& part : character.parts) {
-        auto material = part.material;
-        material.base_color.alpha *= opacity;
-        if (opacity < 0.999F)
-            material.alpha_mode = 2U;
-        frame.draw(*part.mesh, transform, material);
+std::vector<astra::assets::NodePose> default_pose(const Asset& asset) {
+    std::vector<astra::assets::NodePose> result;
+    result.reserve(asset.nodes.size());
+    for (const auto& node : asset.nodes)
+        result.push_back({node.translation, node.rotation, node.scale, node.weights});
+    return result;
+}
+
+std::expected<Matrix4, std::string> inverse_matrix(const Matrix4& matrix) {
+    double augmented[4][8]{};
+    for (std::size_t row = 0; row < 4; ++row) {
+        for (std::size_t column = 0; column < 4; ++column)
+            augmented[row][column] = matrix.values[column * 4 + row];
+        augmented[row][row + 4] = 1.0;
     }
+    for (std::size_t column = 0; column < 4; ++column) {
+        std::size_t pivot = column;
+        for (std::size_t row = column + 1; row < 4; ++row)
+            if (std::abs(augmented[row][column]) > std::abs(augmented[pivot][column]))
+                pivot = row;
+        if (std::abs(augmented[pivot][column]) < 1.0e-10)
+            return std::unexpected("Character node transform is singular");
+        if (pivot != column)
+            for (std::size_t k = 0; k < 8; ++k)
+                std::swap(augmented[pivot][k], augmented[column][k]);
+        const double divisor = augmented[column][column];
+        for (double& value : augmented[column])
+            value /= divisor;
+        for (std::size_t row = 0; row < 4; ++row) {
+            if (row == column)
+                continue;
+            const double factor = augmented[row][column];
+            for (std::size_t k = 0; k < 8; ++k)
+                augmented[row][k] -= factor * augmented[column][k];
+        }
+    }
+    Matrix4 result{};
+    for (std::size_t row = 0; row < 4; ++row)
+        for (std::size_t column = 0; column < 4; ++column)
+            result.values[column * 4 + row] = static_cast<float>(augmented[row][column + 4]);
+    return result;
+}
+
+std::vector<Matrix4> global_matrices(const Asset& asset,
+                                     std::span<const astra::assets::NodePose> poses) {
+    if (poses.size() != asset.nodes.size())
+        throw std::runtime_error("Node pose count does not match the glTF node count");
+    std::vector<Matrix4> result(asset.nodes.size());
+    std::vector<unsigned char> state(asset.nodes.size());
+    const auto build = [&](const auto& self, std::size_t index) -> void {
+        if (state[index] == 2)
+            return;
+        if (state[index] == 1)
+            throw std::runtime_error("glTF node hierarchy contains a cycle");
+        state[index] = 1;
+        const auto& node = asset.nodes[index];
+        Matrix4 local{};
+        if (node.has_matrix) {
+            std::copy(node.matrix.begin(), node.matrix.end(), local.values.data());
+        } else {
+            const auto& pose = poses[index];
+            local = transform_matrix({{pose.translation.x, pose.translation.y, pose.translation.z},
+                                      {pose.rotation.x, pose.rotation.y, pose.rotation.z,
+                                       pose.rotation.w},
+                                      {pose.scale.x, pose.scale.y, pose.scale.z}});
+        }
+        if (node.parent >= 0) {
+            const auto parent = static_cast<std::size_t>(node.parent);
+            if (parent >= asset.nodes.size())
+                throw std::runtime_error("glTF node parent index is invalid");
+            self(self, parent);
+            result[index] = multiply_matrix(result[parent], local);
+        } else {
+            result[index] = local;
+        }
+        state[index] = 2;
+    };
+    for (std::size_t i = 0; i < asset.nodes.size(); ++i)
+        build(build, i);
+    return result;
+}
+
+float dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+Vec3 subtract(Vec3 a, Vec3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+
+Vec3 cross(Vec3 a, Vec3 b) {
+    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+
+Vec3 normalize(Vec3 value) {
+    const float length = std::sqrt(dot(value, value));
+    return length > 1.0e-6F ? Vec3{value.x / length, value.y / length, value.z / length}
+                            : Vec3{0.0F, 0.0F, -1.0F};
+}
+
+Matrix4 camera_view_projection(const astra::game::Camera& camera, float aspect) {
+    const auto forward = normalize(subtract(camera.target, camera.position));
+    auto right = normalize(cross(forward, camera.up));
+    if (dot(right, right) < 0.5F)
+        right = normalize(cross(forward, {0.0F, 0.0F, 1.0F}));
+    const auto up = cross(right, forward);
+    Matrix4 view{};
+    view.values[0] = right.x; view.values[4] = right.y; view.values[8] = right.z;
+    view.values[1] = up.x; view.values[5] = up.y; view.values[9] = up.z;
+    view.values[2] = -forward.x; view.values[6] = -forward.y; view.values[10] = -forward.z;
+    view.values[12] = -dot(right, camera.position);
+    view.values[13] = -dot(up, camera.position);
+    view.values[14] = dot(forward, camera.position);
+
+    Matrix4 projection{};
+    projection.values.fill(0.0F);
+    const float fov = camera.vertical_fov_degrees * std::numbers::pi_v<float> / 180.0F;
+    const float factor = 1.0F / std::tan(fov * 0.5F);
+    projection.values[0] = factor / aspect;
+    projection.values[5] = factor;
+    projection.values[10] = camera.far_clip / (camera.near_clip - camera.far_clip);
+    projection.values[11] = -1.0F;
+    projection.values[14] = camera.near_clip * camera.far_clip /
+                            (camera.near_clip - camera.far_clip);
+    Matrix4 result{};
+    result.values.fill(0.0F);
+    for (std::size_t column = 0; column < 4; ++column)
+        for (std::size_t row = 0; row < 4; ++row)
+            for (std::size_t k = 0; k < 4; ++k)
+                result.values[column * 4 + row] +=
+                    projection.values[k * 4 + row] * view.values[column * 4 + k];
+    return result;
+}
+
+std::expected<std::vector<Matrix4>, std::string>
+skin_palette(const Asset& asset, const Part& part, std::span<const Matrix4> globals) {
+    std::vector<Matrix4> palette;
+    if (part.skin == ~std::uint32_t{0})
+        return palette;
+    if (part.skin >= asset.skins.size() || part.node >= globals.size())
+        return std::unexpected("Character primitive references an invalid skin or node");
+    const auto& skin = asset.skins[part.skin];
+    if (skin.joints.size() != skin.inverse_bind_matrices.size())
+        return std::unexpected("Character skin joint and inverse-bind counts differ");
+    auto inverse_mesh = inverse_matrix(globals[part.node]);
+    if (!inverse_mesh)
+        return std::unexpected(inverse_mesh.error());
+    palette.reserve(skin.joints.size());
+    for (std::size_t i = 0; i < skin.joints.size(); ++i) {
+        const auto joint = skin.joints[i];
+        if (joint >= globals.size())
+            return std::unexpected("Character skin joint index is out of range");
+        Matrix4 inverse_bind{};
+        std::copy(skin.inverse_bind_matrices[i].begin(), skin.inverse_bind_matrices[i].end(),
+                  inverse_bind.values.data());
+        palette.push_back(multiply_matrix(multiply_matrix(*inverse_mesh, globals[joint]),
+                                          inverse_bind));
+    }
+    return palette;
+}
+
+std::expected<void, std::string>
+draw_character(astra::game::Frame& frame, const Character& character, Matrix4 transform,
+               Matrix4 previous_transform,
+               std::span<const astra::assets::NodePose> poses,
+               std::span<const astra::assets::NodePose> previous_poses) {
+    const auto globals = global_matrices(*character.source, poses);
+    const auto previous_globals = global_matrices(*character.source, previous_poses);
+    for (const auto& part : character.parts) {
+        auto palette = skin_palette(*character.source, part, globals);
+        auto previous_palette = skin_palette(*character.source, part, previous_globals);
+        if (!palette || !previous_palette)
+            return std::unexpected(!palette ? palette.error() : previous_palette.error());
+        astra::rhi::DrawItem item{};
+        item.mesh = part.mesh.get();
+        item.model = multiply_matrix(transform, globals[part.node]);
+        item.previous_model = multiply_matrix(previous_transform, previous_globals[part.node]);
+        item.has_previous_transform = true;
+        item.material = part.material;
+        item.use_material = true;
+        // Morph weights belong to the evaluated node pose, not the mesh's
+        // import-time defaults. Keep the previous pose separate so temporal
+        // velocity uses the exact deformation submitted on the prior frame.
+        if (part.node < poses.size())
+            item.morph_weights = poses[part.node].morph_weights;
+        if (part.node < previous_poses.size())
+            item.previous_morph_weights = previous_poses[part.node].morph_weights;
+        item.joint_matrices = *palette;
+        item.previous_joint_matrices = *previous_palette;
+        frame.draw(std::move(item));
+    }
+    return {};
 }
 
 } // namespace
@@ -291,7 +462,7 @@ void draw_character(astra::game::Frame& frame, const Character& character, float
 int main() {
     astra::core::Logger logger{astra::core::LogLevel::info};
     auto created = astra::game::Game::create({
-        .window = {.title = "Astra - The Boarbound", .width = 1280, .height = 800,
+        .window = {.title = "Astra - Character Asset Inspection", .width = 1280, .height = 800,
                    .resizable = true, .high_dpi = true},
     });
     if (!created) {
@@ -308,59 +479,68 @@ int main() {
         return 1;
     }
     logger.log(astra::core::LogLevel::info, "Character",
-               "Loaded an authored 262K-triangle human and a separate three-part boar model. Both use their imported glTF materials.");
-    logger.log(astra::core::LogLevel::info, "Scene",
-               "The scene begins as a human, transitions into the boar, holds the creature form, then reverses. Space pauses, R restarts, Escape exits.");
+               "Loaded the human source and a 966K-triangle boar with a 13-joint skin and four animation clips.");
+    logger.log(astra::core::LogLevel::warning, "Deformation",
+               "The endpoints still have no validated shared topology or authored correspondence. This scene previews the assets and plays the boar's skeletal animation; it does not perform the human-to-boar transformation.");
 
-    bool paused = false;
-    float elapsed = 0.0F;
+    auto human_pose = default_pose(*human->source);
+    auto boar_pose = default_pose(*boar->source);
+    auto previous_human_pose = human_pose;
+    auto previous_boar_pose = boar_pose;
+    const auto idle = std::find_if(boar->source->animations.begin(), boar->source->animations.end(),
+                                   [](const auto& animation) { return animation.name == "idle"; });
+    const auto human_model = model_transform(0.9F, 0.0F, -1.25F);
+    const auto boar_model = model_transform(0.9F, 0.0F, 1.25F);
+
     std::uint64_t frames = 0;
+    Matrix4 previous_view_projection{};
+    Vec3 previous_camera_position{};
+    bool has_previous_view_projection = false;
     game.run([&](astra::game::Frame& frame) {
         if (frame.input.pressed(astra::game::Key::escape)) {
             frame.window.request_close();
             return;
         }
-        if (frame.input.pressed(astra::game::Key::space))
-            paused = !paused;
-        if (frame.input.pressed(astra::game::Key::r))
-            elapsed = 0.0F;
-        if (!paused)
-            elapsed += frame.delta_time;
-
-        frame.camera.position = {3.1F, 2.25F, 5.4F};
+        frame.camera.position = {4.4F, 2.55F, 7.0F};
         frame.camera.target = {0.0F, 0.88F, 0.0F};
-        constexpr float hold_seconds = 2.0F;
-        constexpr float transition_seconds = 4.0F;
-        constexpr float cycle_seconds = hold_seconds * 2.0F + transition_seconds * 2.0F;
-        const float phase = std::fmod(elapsed, cycle_seconds);
-        float boar_amount = 0.0F;
-        if (phase >= hold_seconds && phase < hold_seconds + transition_seconds) {
-            const float t = (phase - hold_seconds) / transition_seconds;
-            boar_amount = t * t * (3.0F - 2.0F * t);
-        } else if (phase >= hold_seconds + transition_seconds &&
-                   phase < hold_seconds * 2.0F + transition_seconds) {
-            boar_amount = 1.0F;
-        } else if (phase >= hold_seconds * 2.0F + transition_seconds) {
-            const float t = (phase - hold_seconds * 2.0F - transition_seconds) / transition_seconds;
-            const float eased = t * t * (3.0F - 2.0F * t);
-            boar_amount = 1.0F - eased;
+        if (idle != boar->source->animations.end()) {
+            const float duration = std::max(idle->duration, 0.001F);
+            auto evaluated = astra::assets::evaluate_animation(
+                *idle, boar->source->nodes, std::fmod(frame.elapsed_time, duration));
+            if (evaluated)
+                boar_pose = std::move(*evaluated);
+        }
+        if (auto result = draw_character(frame, *human, human_model, human_model,
+                                         human_pose, previous_human_pose); !result) {
+            logger.log(astra::core::LogLevel::error, "Character", result.error());
+            game.close();
+            return;
+        }
+        if (auto result = draw_character(frame, *boar, boar_model, boar_model,
+                                         boar_pose, previous_boar_pose); !result) {
+            logger.log(astra::core::LogLevel::error, "Character", result.error());
+            game.close();
+            return;
         }
 
-        const float breath = std::sin(elapsed * 2.1F) * 0.012F;
-        const float human_opacity = 1.0F - boar_amount;
-        const float boar_opacity = boar_amount;
-        draw_character(frame, *human, human_opacity,
-                       model_transform(1.0F - boar_amount * 0.12F,
-                                       boar_amount * 0.12F, breath * (1.0F - boar_amount)));
-        draw_character(frame, *boar, boar_opacity,
-                       model_transform(0.82F + boar_amount * 0.18F,
-                                       -0.12F * (1.0F - boar_amount), breath * boar_amount));
-
-        if (auto result = frame.render({0.025F, 0.031F, 0.043F, 1.0F}); !result) {
+        const float aspect = static_cast<float>(std::max(frame.window.width(), 1U)) /
+                             static_cast<float>(std::max(frame.window.height(), 1U));
+        const auto current_view_projection = camera_view_projection(frame.camera, aspect);
+        astra::rhi::SceneSettings scene_settings{};
+        scene_settings.previous_view_projection = previous_view_projection;
+        scene_settings.has_previous_view_projection = has_previous_view_projection;
+        scene_settings.previous_camera_position = previous_camera_position;
+        if (auto result = frame.render({0.025F, 0.031F, 0.043F, 1.0F}, scene_settings); !result) {
             logger.log(astra::core::LogLevel::error, "Renderer", result.error().message);
             game.close();
             return;
         }
+        // Advance camera and deformation history only after a successful render.
+        previous_view_projection = current_view_projection;
+        previous_camera_position = frame.camera.position;
+        has_previous_view_projection = true;
+        previous_human_pose = human_pose;
+        previous_boar_pose = boar_pose;
         ++frames;
     });
     logger.log(astra::core::LogLevel::info, "Renderer",

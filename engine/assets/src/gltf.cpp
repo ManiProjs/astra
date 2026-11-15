@@ -315,14 +315,16 @@ Asset load(const std::filesystem::path& path,LoadOptions options){
             const auto& m = *arr->at(mi);
             Mesh mesh;
             mesh.name = m.get("name") ? m.get("name")->string() : "mesh_" + std::to_string(mi);
+            if (const auto* weights = m.get("weights")) {
+                mesh.weights.reserve(weights->size());
+                for (std::size_t i = 0; i < weights->size(); ++i)
+                    mesh.weights.push_back(number(*weights->at(i)));
+            }
             const auto* prims = m.get("primitives");
             if (!prims)
                 throw std::runtime_error("mesh has no primitives");
             for (std::size_t pi = 0; pi < prims->size(); ++pi) {
                 const auto& p = *prims->at(pi);
-                if (p.get("targets"))
-                    throw std::runtime_error(
-                        "morph target primitives are not supported by this loader");
                 Primitive prim;
                 prim.material = index(p, "material");
                 prim.mode = optional_u32(p, "mode", 4);
@@ -426,6 +428,47 @@ Asset load(const std::filesystem::path& path,LoadOptions options){
                 });
                 fill("WEIGHTS_0", 4,
                      [](Vertex& v, const float* p) { v.weights = {p[0], p[1], p[2], p[3]}; });
+                if (const auto* targets = p.get("targets")) {
+                    if (targets->size() > 256U)
+                        throw std::runtime_error("primitive exceeds the 256 morph target limit");
+                    prim.morph_targets.reserve(targets->size());
+                    for (std::size_t target_index = 0; target_index < targets->size(); ++target_index) {
+                        const auto& target = *targets->at(target_index);
+                        Primitive::MorphTarget morph;
+                        const auto read_delta = [&](const char* name, std::vector<Vec3>& output) {
+                            const auto* accessor = target.get(name);
+                            if (!accessor)
+                                return;
+                            const auto id = u32(*accessor, name);
+                            if (id >= c.accessors.size() || c.accessors[id].component != 5126 ||
+                                c.accessors[id].type != "VEC3" || c.accessors[id].normalized)
+                                throw std::runtime_error(std::string("morph ") + name +
+                                                         " must use an unnormalized FLOAT VEC3 accessor");
+                            const auto values = c.read_accessor(id, 3);
+                            if (values.size() / 3U != count)
+                                throw std::runtime_error(std::string("morph ") + name +
+                                                         " accessor count does not match POSITION");
+                            c.consume_bytes(count * sizeof(Vec3), "expanded morph target data");
+                            output.reserve(count);
+                            for (std::size_t vertex = 0; vertex < count; ++vertex)
+                                output.push_back({values[vertex * 3U], values[vertex * 3U + 1U],
+                                                  values[vertex * 3U + 2U]});
+                        };
+                        read_delta("POSITION", morph.positions);
+                        read_delta("NORMAL", morph.normals);
+                        read_delta("TANGENT", morph.tangents);
+                        if (target.size() == 0)
+                            throw std::runtime_error("morph target has no supported attributes");
+                        if (target.get("POSITION") == nullptr && target.get("NORMAL") == nullptr &&
+                            target.get("TANGENT") == nullptr)
+                            throw std::runtime_error("morph target has no POSITION, NORMAL, or TANGENT delta");
+                        if (target.size() != (target.get("POSITION") != nullptr) +
+                                                 (target.get("NORMAL") != nullptr) +
+                                                 (target.get("TANGENT") != nullptr))
+                            throw std::runtime_error("morph target contains an unsupported attribute");
+                        prim.morph_targets.push_back(std::move(morph));
+                    }
+                }
                 if (const auto* idx = p.get("indices")) {
                     const auto id = u32(*idx, "indices accessor");
                     if (id >= c.accessors.size())
@@ -460,6 +503,15 @@ Asset load(const std::filesystem::path& path,LoadOptions options){
             }
             asset.meshes.push_back(std::move(mesh));
         }
+        for (const auto& mesh : asset.meshes) {
+            const auto target_count = mesh.primitives.empty() ? 0U :
+                mesh.primitives.front().morph_targets.size();
+            for (const auto& primitive : mesh.primitives)
+                if (primitive.morph_targets.size() != target_count)
+                    throw std::runtime_error("all primitives in a mesh must define the same morph target count");
+            if (!mesh.weights.empty() && mesh.weights.size() != target_count)
+                throw std::runtime_error("mesh default weight count differs from its morph target count");
+        }
     }
     if (const auto* arr = root.get("nodes")) {
         asset.nodes.resize(arr->size());
@@ -469,6 +521,11 @@ Asset load(const std::filesystem::path& path,LoadOptions options){
             x.name = n.get("name") ? n.get("name")->string() : "node_" + std::to_string(i);
             x.mesh = index(n, "mesh");
             x.skin = index(n, "skin");
+            if (const auto* weights = n.get("weights")) {
+                x.weights.reserve(weights->size());
+                for (std::size_t k = 0; k < weights->size(); ++k)
+                    x.weights.push_back(number(*weights->at(k)));
+            }
             x.translation = vec3(n.get("translation"));
             x.rotation = vec4(n.get("rotation"), x.rotation);
             x.scale = vec3(n.get("scale"), x.scale);
@@ -489,6 +546,24 @@ Asset load(const std::filesystem::path& path,LoadOptions options){
             auto& n = asset.nodes[i];
             if (n.mesh != ~std::uint32_t{0} && n.mesh >= asset.meshes.size())
                 throw std::runtime_error("node mesh index out of range");
+            if (n.mesh == ~std::uint32_t{0} && !n.weights.empty())
+                throw std::runtime_error("node morph weights require a mesh reference");
+            if (n.mesh != ~std::uint32_t{0} && !n.weights.empty()) {
+                const auto target_count = asset.meshes[n.mesh].weights.size();
+                const auto primitive_target_count = asset.meshes[n.mesh].primitives.empty() ? 0U :
+                    asset.meshes[n.mesh].primitives.front().morph_targets.size();
+                const auto expected_count = target_count != 0U ? target_count : primitive_target_count;
+                if (n.weights.size() != expected_count)
+                    throw std::runtime_error("node morph weight count differs from its mesh target count");
+            }
+            if (n.mesh != ~std::uint32_t{0} && n.weights.empty()) {
+                const auto& mesh = asset.meshes[n.mesh];
+                const auto target_count = mesh.primitives.empty() ? 0U :
+                    mesh.primitives.front().morph_targets.size();
+                n.weights = mesh.weights;
+                if (n.weights.empty())
+                    n.weights.resize(target_count, 0.0F);
+            }
             for (auto child : n.children) {
                 if (child >= asset.nodes.size() || child == i)
                     throw std::runtime_error("invalid node child index");
@@ -594,12 +669,16 @@ Asset load(const std::filesystem::path& path,LoadOptions options){
             const auto&channels=required(a,"channels");
             for(std::size_t ci=0;ci<channels.size();++ci){
                 const auto&ch=*channels.at(ci);AnimationChannel out;out.sampler=index(ch,"sampler");if(out.sampler>=x.samplers.size())throw std::runtime_error("animation sampler index out of range");
-                const auto&t=required(ch,"target");out.node=index(t,"node");if(out.node>=asset.nodes.size())throw std::runtime_error("animation target node index out of range");if(asset.nodes[out.node].has_matrix)throw std::runtime_error("animation target node must use TRS properties, not matrix");
-                auto path_name=required(t,"path").string();if(path_name=="translation")out.path=AnimationPath::translation;else if(path_name=="rotation")out.path=AnimationPath::rotation;else if(path_name=="scale")out.path=AnimationPath::scale;else if(path_name=="weights")throw std::runtime_error("morph-weight animation is unsupported because morph targets are not loaded");else throw std::runtime_error("unsupported animation target path");
+                const auto&t=required(ch,"target");out.node=index(t,"node");if(out.node>=asset.nodes.size())throw std::runtime_error("animation target node index out of range");
+                auto path_name=required(t,"path").string();if(path_name=="translation")out.path=AnimationPath::translation;else if(path_name=="rotation")out.path=AnimationPath::rotation;else if(path_name=="scale")out.path=AnimationPath::scale;else if(path_name=="weights"){out.path=AnimationPath::weights;const auto mesh_index=asset.nodes[out.node].mesh;if(mesh_index>=asset.meshes.size())throw std::runtime_error("morph-weight animation target node must reference a mesh");const auto&mesh=asset.meshes[mesh_index];out.weight_count=static_cast<std::uint32_t>(mesh.primitives.empty()?0U:mesh.primitives.front().morph_targets.size());if(out.weight_count==0)throw std::runtime_error("morph-weight animation target mesh has no morph targets");}else throw std::runtime_error("unsupported animation target path");
+                if(asset.nodes[out.node].has_matrix&&out.path!=AnimationPath::weights)throw std::runtime_error("animation TRS target node must use TRS properties, not matrix");
                 auto&sm=x.samplers[out.sampler];const auto&out_accessor=c.accessors[sampler_outputs[out.sampler]];const std::size_t factor=sm.interpolation==Interpolation::cubic_spline?3:1;
                 if(out.path==AnimationPath::rotation&&(sm.components!=4||out_accessor.type!="VEC4"))throw std::runtime_error("rotation animation output must be FLOAT VEC4");
                 if((out.path==AnimationPath::translation||out.path==AnimationPath::scale)&&(sm.components!=3||out_accessor.type!="VEC3"))throw std::runtime_error("translation/scale animation output must be FLOAT VEC3");
-                if(sm.values.size()!=sm.times.size()*sm.components*factor)throw std::runtime_error("animation sampler input/output counts do not match");
+                if(out.path==AnimationPath::weights&&(sm.components!=1||out_accessor.type!="SCALAR"||out_accessor.component!=5126||out_accessor.normalized))throw std::runtime_error("morph-weight animation output must be FLOAT SCALAR");
+                if(!std::ranges::all_of(sm.values,[](float value){return std::isfinite(value);}))throw std::runtime_error("animation sampler contains non-finite output values");
+                const std::size_t value_components=out.path==AnimationPath::weights?out.weight_count:sm.components;
+                if(value_components==0||sm.times.size()>std::numeric_limits<std::size_t>::max()/(value_components*factor)||sm.values.size()!=sm.times.size()*value_components*factor)throw std::runtime_error("animation sampler input/output counts do not match its target");
                 x.channels.push_back(out);
             }
             asset.animations.push_back(std::move(x));

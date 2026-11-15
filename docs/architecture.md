@@ -93,7 +93,8 @@ The macOS Metal path now includes:
   skins, inverse-bind matrices, and STEP/LINEAR/CUBICSPLINE TRS animation channels. macOS image decoding uses
   ImageIO/CoreGraphics; the current importer accepts texture-coordinate sets 0 and 1.
 - Metallic/roughness PBR with base-color, metallic/roughness, normal, occlusion, and emissive texture slots;
-  mipmapped Metal textures; GGX/Fresnel lighting; analytic sky-environment diffuse/specular approximation.
+  mipmapped Metal textures; GGX/Fresnel lighting; configurable scene-linear directional-light radiance;
+  analytic sky-environment diffuse/specular approximation.
 - Three stabilized directional shadow cascades at 1024²/768²/384² with snap-margin guards, overlapping scene-caster
   depth bounds, five-tap PCF with lit out-of-map samples, and
   blended split transitions; an RGBA16Float HDR scene target; eight-sample Halton projection jitter; RGBA16Float
@@ -118,9 +119,10 @@ The macOS Metal path now includes:
   or production-grade topology-preserving simplifier.
 - Bounded asynchronous heightfield chunk generation/eviction, per-chunk terrain meshlets uploaded as one persistent
   virtual-geometry resource, three lazily cached vegetation GPU meshes per resident chunk, LOD-scaled foliage
-  density, animated wind deformation shared by the scene and shadow vertex paths, layered broadleaf canopies,
-  understory shrubs, and rocks; plus a capsule-footprint character controller with gravity, jumping, slope limits,
-  diagonal contact samples, and sliding.
+  density, curved multi-segment grass ribbons, and a shared world-space wind deformation evaluated consistently
+  for current color, previous-frame motion and cascaded shadow positions. The open-world scene combines six scanned CC0 tree, sapling, shrub, fern, and
+  mossy-rock models with deterministic grass placement; plus a capsule-footprint character controller with gravity,
+  jumping, slope limits, diagonal contact samples, and sliding.
 
 The open-world example connects these systems in one playable third-person scene. CPU/GPU resources are owned
 by streamed chunk/model lifetimes; chunk count, worker concurrency, and terrain resolution have explicit bounds.
@@ -132,12 +134,18 @@ budgets remain important.
 - Only the macOS AppKit/Metal backend is implemented. Windows/Linux windows and graphics backends remain planned.
 - HDR is used for the linear scene target and tone-mapped to an SDR sRGB drawable; direct EDR/HDR display output
   is not implemented.
+- The forward renderer currently supports one directional key light. It has no point/spot light list or clustered
+  light culling, no screen-space ambient occlusion, no dynamic global illumination, no screen-space reflections
+  or local reflection probes, and no bloom or automatic exposure. Material occlusion maps are not substitutes for
+  screen-space AO. Directional-light radiance is now a scene setting instead of a shader constant.
 - Metal exposes engine-level image-based lighting through `Renderer::create_environment`: linear RGBA32F
   equirectangular input is converted to a cubemap, mipmapped, convolved into diffuse irradiance, GGX-prefiltered
   across roughness levels, and paired with a split-sum BRDF integration LUT. PBR materials use the irradiance,
   prefiltered specular, and BRDF resources when a `GpuEnvironment` is assigned in `SceneSettings`; the analytic
-  sky/ambient approximation remains the fallback. Radiance RGBE decoding is available as a bounded memory-only
-  asset API; file loading and environment cache serialization are left to applications.
+  sky/ambient approximation remains the fallback. The open-world example now creates an outdoor linear HDR sky
+  environment and assigns it to the scene, so terrain and vegetation use the full IBL path. Radiance RGBE decoding
+  is available as a bounded memory-only asset API; file loading and environment cache serialization are left to
+  applications.
 - Volumetric clouds now expose reusable scene settings for altitude, density, coverage, wind velocity, enablement,
   and bounded ray-step quality. The Metal sky pass ray-marches a world-space 3D noise/height-density field and feeds
   motion and reactive coverage into temporal AA. This is not yet a temporally accumulated 3D weather simulation,
@@ -161,14 +169,37 @@ budgets remain important.
   stepping, and terrain-mesh collision. The open-world player uses it against streamed triangle-mesh terrain when
   `ASTRA_ENABLE_PHYSICS` is enabled. Shape casts and a general rigid-body character motor are not yet exposed;
   disabling the physics module retains the example's legacy heightfield-controller fallback.
-- glTF morph targets/weights, advanced compression extensions, second skin-influence sets
+- glTF morph-target data is imported for POSITION, NORMAL, and TANGENT deltas with bounded
+  allocation and mesh/node default weights. STEP, LINEAR, and CUBICSPLINE weight channels feed
+  node poses. Metal stores immutable target deltas per mesh and current/previous weights per draw
+  or instance; scene and shadow vertex paths apply morphs before skeletal skinning, and the scene
+  path evaluates previous morph weights with the previous joint palette for motion vectors. The
+  renderer expands mesh culling bounds by the conservative sum of each target's maximum position
+  delta multiplied by the absolute current weight, including per-instance weights. The GPU regression
+  kernel covers multi-target deformation, per-instance weights, skinning order, previous-frame
+  positions, and command-buffer resource retention. An offscreen Metal regression also executes the
+  production `astra_vertex` and `astra_shadow_vertex` entry points and checks current/previous clip
+  coordinates. CPU tests cover visible-instance weight compaction, history fallback, conservative
+  bounds, and glTF LINEAR/CUBICSPLINE weight-channel loading. A 143,446-vertex, two-instance, two-target,
+  one-joint GPU dispatch measured 0.79 ms in the current validation run on the Apple GPU; this is the shared deformation
+  helper regression kernel, not a full-scene frame-time measurement. The supplied human/boar assets
+  still cannot form a valid transformation: the human is static with 143,446 vertices split across
+  306 disconnected components; the domestic boar is static triangle soup with 4,542 vertices,
+  1,514 triangles, no textures, and no rig. The example now displays them side by side for asset
+  inspection and explicitly reports that it is not a transformation. A detailed wild-boar asset and
+  authored topology/correspondence data are still required for the actual transformation scene.
+  Advanced compression extensions, second skin-influence sets
   (`JOINTS_1`/`WEIGHTS_1`), and texture-coordinate sets above 1 are not implemented. Metal uses weighted blended
   order-independent transparency for glTF BLEND materials; this is approximate and does not preserve exact
   refractive transmission or physically correct colored transmittance. glTF 32-bit indices currently pass
   through a float accessor decode, so extremely large index values above float's exact-integer range need a dedicated
   integer decode path. Image decoding outside macOS is currently an explicit unsupported stub.
-- The open-world foliage is procedural and stylized geometry. It does not yet use scanned plant assets, alpha-tested
-  leaf cards, species-specific growth/season systems, interaction/bend response, or GPU-instanced vegetation culling.
+- The open-world scene uses scanned plant assets, but its grass is generated curved ribbon geometry and the
+  deterministic species distribution remains a small demonstration biome. It does not yet have alpha-tested
+  leaf-card rendering, species-specific growth/season systems, player/physics-driven foliage interaction, biome
+  authoring, or GPU-driven vegetation instance culling. The outdoor IBL environment is a generated clear-sky
+  approximation, not a captured forest HDR panorama; volumetric clouds are rendered separately and do not cast
+  cloud shadows into the scene.
 
 ## Implemented runtime foundation
 
@@ -198,7 +229,6 @@ virtual filesystem, asset database, or sandbox. Memory tracking is an allocator 
 a full engine memory budget/telemetry system. The thread pool is a general executor, not yet a
 dependency-aware frame/job graph. The current renderer is an integrated experimental vertical
 slice; its render graph executes pass callbacks but does not yet allocate/alias transient resources or emit
-explicit backend barriers. It does not yet provide indirect-command-buffer multi-draw, full HDR image-based
-lighting, animation retargeting,
-morph targets, asset hot reload, or a production editor. New systems should remain behind the
+explicit backend barriers. It does not yet provide a production render graph, animation retargeting, asset hot
+reload, or a production editor. New systems should remain behind the
 existing module boundaries rather than expanding the open-world example into a monolith.

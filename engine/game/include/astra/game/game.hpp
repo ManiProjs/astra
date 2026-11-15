@@ -96,6 +96,7 @@ struct Frame final {
     // Queue a mesh for this frame. Call render() once after updating the scene.
     void draw(const rhi::GpuMesh& mesh, rhi::Matrix4 model = {},
               rhi::MaterialData material = {});
+    void draw(rhi::DrawItem item);
     [[nodiscard]] std::expected<void, rhi::RenderError>
     render(rhi::Color clear_color = {0.035F, 0.045F, 0.065F, 1.0F},
            rhi::SceneSettings settings = {});

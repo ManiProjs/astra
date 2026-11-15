@@ -93,6 +93,71 @@ int main() {
     }
     assert(boar_vertices > 4000);
     assert(boar_indices > 4000);
+
+    const auto animated_boar = astra::assets::load_gltf(
+        std::filesystem::path{ASTRA_ANIMATED_BOAR_ASSET_PATH});
+    assert(animated_boar);
+    assert(animated_boar->meshes.size() == 1);
+    assert(animated_boar->nodes.size() >= 18);
+    assert(animated_boar->skins.size() == 1);
+    assert(animated_boar->skins.front().joints.size() >= 12);
+    assert(animated_boar->skins.front().joints.size() ==
+           animated_boar->skins.front().inverse_bind_matrices.size());
+    assert(animated_boar->animations.size() == 4);
+    assert(!animated_boar->materials.empty());
+    assert(!animated_boar->images.empty());
+    std::size_t animated_boar_vertices = 0;
+    std::size_t animated_boar_indices = 0;
+    for (const auto& mesh : animated_boar->meshes) {
+        assert(mesh.primitives.size() == 1);
+        const auto& primitive = mesh.primitives.front();
+        assert(primitive.mode == 4U);
+        animated_boar_vertices += primitive.vertices.size();
+        animated_boar_indices += primitive.indices.size();
+        for (const auto& vertex : primitive.vertices) {
+            assert(std::isfinite(vertex.position.x));
+            assert(std::isfinite(vertex.position.y));
+            assert(std::isfinite(vertex.position.z));
+            assert(std::isfinite(vertex.texcoord0.x));
+            assert(std::isfinite(vertex.texcoord0.y));
+        }
+    }
+    assert(animated_boar_vertices > 500000);
+    assert(animated_boar_indices > 2800000);
+    assert(animated_boar->meshes.front().primitives.front().has_joint_attributes);
+    assert(animated_boar->meshes.front().primitives.front().has_weight_attributes);
+    for (const auto& vertex : animated_boar->meshes.front().primitives.front().vertices) {
+        const float sum = vertex.weights.x + vertex.weights.y + vertex.weights.z + vertex.weights.w;
+        assert(std::isfinite(sum));
+        assert(sum >= 0.98F && sum <= 1.02F);
+    }
+    for (const auto& animation : animated_boar->animations) {
+        assert(!animation.channels.empty());
+        const auto boar_pose = astra::assets::evaluate_animation(
+            animation, animated_boar->nodes, animation.duration * 0.5F);
+        assert(boar_pose && boar_pose->size() == animated_boar->nodes.size());
+        bool animated_node = false;
+        bool changed_pose = false;
+        for (const auto& channel : animation.channels) {
+            assert(channel.node < animated_boar->nodes.size());
+            assert(channel.sampler < animation.samplers.size());
+            animated_node = true;
+        }
+        assert(animated_node);
+        for (std::size_t node = 0; node < animated_boar->nodes.size(); ++node) {
+            const auto& rest = animated_boar->nodes[node];
+            const auto& current = (*boar_pose)[node];
+            changed_pose = changed_pose ||
+                std::abs(current.translation.x - rest.translation.x) > 1.0e-4F ||
+                std::abs(current.translation.y - rest.translation.y) > 1.0e-4F ||
+                std::abs(current.translation.z - rest.translation.z) > 1.0e-4F ||
+                std::abs(current.rotation.x - rest.rotation.x) > 1.0e-4F ||
+                std::abs(current.rotation.y - rest.rotation.y) > 1.0e-4F ||
+                std::abs(current.rotation.z - rest.rotation.z) > 1.0e-4F ||
+                std::abs(current.rotation.w - rest.rotation.w) > 1.0e-4F;
+        }
+        assert(changed_pose);
+    }
     for (const auto& animation : player->animations) {
         assert(!animation.channels.empty());
         const auto player_pose = astra::assets::evaluate_animation(

@@ -147,6 +147,12 @@ Renderer::render_scene(std::span<const rhi::DrawItem> draw_items,
             .message = "The renderer has no initialized device.",
         });
     }
+    if (const auto valid = rhi::validate_scene_lighting(settings); !valid) {
+        return std::unexpected(rhi::RenderError{
+            .code = rhi::RenderErrorCode::invalid_scene,
+            .message = valid.error(),
+        });
+    }
     return device_->render_scene(clear_color, draw_items, view_projection, settings);
 }
 

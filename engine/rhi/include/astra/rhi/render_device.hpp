@@ -1,6 +1,7 @@
 #pragma once
 
 #include <astra/rhi/types.hpp>
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstddef>
@@ -35,7 +36,102 @@ struct MeshData final {
     // The renderer copies these spans during create_mesh; callers may release them afterward.
     std::span<const MeshVertex> vertices;
     std::span<const std::uint32_t> indices;
+    struct MorphTarget final {
+        // Per-vertex deltas. Empty attributes are treated as zero deltas.
+        std::span<const Vec3> positions;
+        std::span<const Vec3> normals;
+        std::span<const Vec3> tangents;
+    };
+    std::span<const MorphTarget> morph_targets{};
 };
+
+[[nodiscard]] inline std::expected<void, std::string>
+validate_morph_targets(std::size_t vertex_count,
+                       std::span<const MeshData::MorphTarget> morph_targets) {
+    if (morph_targets.size() > 256U)
+        return std::unexpected("A mesh exceeds the 256 morph target limit.");
+    if (!morph_targets.empty() && vertex_count == 0U)
+        return std::unexpected("Morph targets require a non-empty base vertex array.");
+    for (const auto& target : morph_targets) {
+        const auto valid_attribute = [vertex_count](std::span<const Vec3> attribute) {
+            return (attribute.empty() || attribute.size() == vertex_count) &&
+                   std::ranges::all_of(attribute, [](const Vec3& value) {
+                       return std::isfinite(value.x) && std::isfinite(value.y) &&
+                              std::isfinite(value.z);
+                   });
+        };
+        if (!valid_attribute(target.positions) || !valid_attribute(target.normals) ||
+            !valid_attribute(target.tangents))
+            return std::unexpected(
+                "Morph target attributes must be finite and either empty or match the vertex count.");
+        if (target.positions.empty() && target.normals.empty() && target.tangents.empty())
+            return std::unexpected("A morph target must contain at least one vertex attribute.");
+    }
+    return {};
+}
+
+// Conservative displacement bound for morph-driven frustum culling. Each
+// radius encloses one target's POSITION deltas; the triangle inequality keeps
+// the result safe for negative and greater-than-one animation weights too.
+[[nodiscard]] inline float morph_displacement_bound(std::span<const float> target_radii,
+                                                      std::span<const float> weights) noexcept {
+    if (weights.empty())
+        return 0.0F;
+    if (weights.size() != target_radii.size())
+        return std::numeric_limits<float>::infinity();
+    float result = 0.0F;
+    for (std::size_t target = 0; target < weights.size(); ++target) {
+        if (!std::isfinite(weights[target]) || !std::isfinite(target_radii[target]) ||
+            target_radii[target] < 0.0F)
+            return std::numeric_limits<float>::infinity();
+        result += std::abs(weights[target]) * target_radii[target];
+    }
+    return result;
+}
+
+[[nodiscard]] inline bool morph_weights_are_finite(std::span<const float> weights) noexcept {
+    return std::ranges::all_of(weights, [](float weight) { return std::isfinite(weight); });
+}
+
+template <typename T>
+[[nodiscard]] inline std::span<const T> previous_frame_span(
+    std::span<const T> current, std::span<const T> previous, bool has_previous_frame) noexcept {
+    return has_previous_frame && !previous.empty() ? previous : current;
+}
+
+[[nodiscard]] inline std::expected<void, std::string> compact_instance_morph_weights(
+    std::span<const float> current, std::span<const float> previous,
+    std::span<const std::uint32_t> visible_instances, std::size_t target_count,
+    std::vector<float>& compacted_current, std::vector<float>* compacted_previous = nullptr) {
+    if (target_count == 0U || current.size() % target_count != 0U ||
+        (!previous.empty() && previous.size() != current.size()) ||
+        !morph_weights_are_finite(current) || !morph_weights_are_finite(previous) ||
+        (compacted_previous != nullptr && compacted_previous == &compacted_current))
+        return std::unexpected("Instance morph weights have an invalid target count or value.");
+    if (visible_instances.size() > std::numeric_limits<std::size_t>::max() / target_count)
+        return std::unexpected("Visible instance morph weights exceed the addressable size.");
+    const auto instance_count = current.size() / target_count;
+    compacted_current.clear();
+    compacted_current.reserve(visible_instances.size() * target_count);
+    if (compacted_previous != nullptr) {
+        compacted_previous->clear();
+        compacted_previous->reserve(visible_instances.size() * target_count);
+    }
+    for (const auto instance : visible_instances) {
+        if (instance >= instance_count)
+            return std::unexpected("Visible instance index exceeds the morph-weight array.");
+        const auto offset = static_cast<std::size_t>(instance) * target_count;
+        compacted_current.insert(compacted_current.end(), current.begin() + static_cast<std::ptrdiff_t>(offset),
+                                 current.begin() + static_cast<std::ptrdiff_t>(offset + target_count));
+        if (compacted_previous != nullptr) {
+            const auto source = previous.empty() ? current : previous;
+            compacted_previous->insert(compacted_previous->end(),
+                source.begin() + static_cast<std::ptrdiff_t>(offset),
+                source.begin() + static_cast<std::ptrdiff_t>(offset + target_count));
+        }
+    }
+    return {};
+}
 
 // One renderable node in a virtual-geometry hierarchy. The sphere is in mesh
 // local space. Indices address vertices relative to base_vertex. parent_index
@@ -335,6 +431,13 @@ struct DrawItem final {
     Matrix4 previous_model{};
     bool has_previous_transform{};
     std::span<const Matrix4> previous_joint_matrices{};
+    // Current and previous morph weights are ordered exactly like MeshData::morph_targets.
+    // Empty previous weights reuse current weights. Instance arrays are tightly packed as
+    // [instance][target] and must match instance_transforms.size() * target_count.
+    std::span<const float> morph_weights{};
+    std::span<const float> previous_morph_weights{};
+    std::span<const float> instance_morph_weights{};
+    std::span<const float> previous_instance_morph_weights{};
     // Optional per-instance world transforms. The mesh/material are shared by all instances.
     std::span<const Matrix4> instance_transforms{};
     // Empty means reuse instance_transforms for static instances.
@@ -363,7 +466,29 @@ struct SceneSettings final {
     float render_scale{1.0F};
     VolumetricCloudSettings clouds{};
     const GpuEnvironment* environment{};
+    // Linear scene-referred radiance multiplier for the directional key light.
+    // Kept separate from direction so day/night systems can change sun energy
+    // and color without rebuilding scene geometry or editing shader constants.
+    Vec3 directional_light_radiance{3.8F, 3.55F, 3.15F};
 };
+
+[[nodiscard]] inline std::expected<void, std::string>
+validate_scene_lighting(const SceneSettings& settings) {
+    const auto finite = [](Vec3 value) {
+        return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+    };
+    if (!finite(settings.light_direction) ||
+        settings.light_direction.x * settings.light_direction.x +
+                settings.light_direction.y * settings.light_direction.y +
+                settings.light_direction.z * settings.light_direction.z < 1.0e-8F)
+        return std::unexpected("Directional light direction must be finite and non-zero.");
+    if (!finite(settings.directional_light_radiance) ||
+        settings.directional_light_radiance.x < 0.0F ||
+        settings.directional_light_radiance.y < 0.0F ||
+        settings.directional_light_radiance.z < 0.0F)
+        return std::unexpected("Directional light radiance must be finite and non-negative.");
+    return {};
+}
 
 enum class RenderErrorCode : unsigned char {
     unsupported_backend,

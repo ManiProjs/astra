@@ -100,6 +100,8 @@ The Rust workspace has no members until the first developer-tool crate is introd
 See [docs/architecture.md](docs/architecture.md) for module ownership and dependency rules,
 [docs/runtime-foundation.md](docs/runtime-foundation.md) for the initial runtime APIs, and
 [docs/build-and-development.md](docs/build-and-development.md) for the local workflow.
+See [docs/realism-roadmap.md](docs/realism-roadmap.md) for the dependency-ordered path from the
+current experimental vertical slice to a production-oriented engine.
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes.
 
 ## Installation size policy

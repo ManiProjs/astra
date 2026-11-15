@@ -16,6 +16,7 @@ struct NodePose final {
     Vec3 translation{};
     Vec4 rotation{0.0F, 0.0F, 0.0F, 1.0F};
     Vec3 scale{1.0F, 1.0F, 1.0F};
+    std::vector<float> morph_weights;
 };
 
 struct AnimationError final {
@@ -71,9 +72,8 @@ inline Vec3 read3(const std::vector<float>& values, std::size_t offset) noexcept
 } // namespace animation_detail
 
 // Evaluates one glTF animation at an absolute clip time. The returned pose has
-// one entry per asset node and starts with each node's authored TRS transform.
-// Matrix-authored nodes and morph-weight channels are rejected because they
-// cannot be represented by this TRS-only pose type.
+// one entry per asset node and starts with each node's authored TRS transform
+// and default morph weights. Matrix-authored nodes cannot be animated.
 [[nodiscard]] inline std::expected<std::vector<NodePose>, AnimationError>
 evaluate_animation(const Animation& animation, std::span<const Node> nodes, float time) {
     using namespace animation_detail;
@@ -83,9 +83,9 @@ evaluate_animation(const Animation& animation, std::span<const Node> nodes, floa
     pose.reserve(nodes.size());
     for (const auto& node : nodes) {
         if (node.has_matrix)
-            pose.push_back({});
+            pose.push_back({.morph_weights = node.weights});
         else
-            pose.push_back({node.translation, normalize(node.rotation), node.scale});
+            pose.push_back({node.translation, normalize(node.rotation), node.scale, node.weights});
     }
 
     for (const auto& channel : animation.channels) {
@@ -96,18 +96,20 @@ evaluate_animation(const Animation& animation, std::span<const Node> nodes, floa
         if (channel.path != AnimationPath::translation && channel.path != AnimationPath::rotation &&
             channel.path != AnimationPath::scale && channel.path != AnimationPath::weights)
             return std::unexpected(AnimationError{"unknown animation target path"});
-        if (channel.path == AnimationPath::weights)
-            return std::unexpected(AnimationError{"morph-weight animation is not supported by TRS pose evaluation"});
-        if (nodes[channel.node].has_matrix)
-            return std::unexpected(AnimationError{"cannot animate a node authored with a matrix transform"});
-
         const auto& sampler = animation.samplers[channel.sampler];
-        const std::size_t components = channel.path == AnimationPath::rotation ? 4U : 3U;
+        const bool weights = channel.path == AnimationPath::weights;
+        if (nodes[channel.node].has_matrix && !weights)
+            return std::unexpected(AnimationError{"cannot animate TRS properties on a node authored with a matrix transform"});
+        const std::size_t components = weights ? channel.weight_count
+            : channel.path == AnimationPath::rotation ? 4U : 3U;
         const std::size_t factor = sampler.interpolation == Interpolation::cubic_spline ? 3U : 1U;
-        if (sampler.components != components || sampler.times.empty() ||
+        if (components == 0U || (weights ? sampler.components != 1U : sampler.components != components) ||
+            sampler.times.empty() ||
             sampler.times.size() > std::numeric_limits<std::size_t>::max()/(components*factor) ||
             sampler.values.size() != sampler.times.size()*components*factor)
             return std::unexpected(AnimationError{"animation sampler has an invalid shape for its channel"});
+        if (weights && pose[channel.node].morph_weights.size() != components)
+            return std::unexpected(AnimationError{"morph-weight channel count differs from the node's morph target count"});
         for (std::size_t i = 0; i < sampler.times.size(); ++i) {
             if (!std::isfinite(sampler.times[i]) || sampler.times[i] < 0.0F ||
                 (i && !(sampler.times[i] > sampler.times[i-1])))
@@ -140,6 +142,26 @@ evaluate_animation(const Animation& animation, std::span<const Node> nodes, floa
         const bool rotation = channel.path == AnimationPath::rotation;
         const auto a_offset = key_value_offset(left);
         const auto b_offset = key_value_offset(right);
+        auto& target = pose[channel.node];
+        if (weights) {
+            for (std::size_t component = 0; component < components; ++component) {
+                const auto a = a_offset + component;
+                const auto b = b_offset + component;
+                float value = sampler.values[a];
+                if (left != right && sampler.interpolation == Interpolation::linear) {
+                    value += (sampler.values[b] - value) * t;
+                } else if (left != right && sampler.interpolation == Interpolation::cubic_spline) {
+                    const auto out_tangent = a + components;
+                    const auto in_tangent = b - components;
+                    value = hermite(sampler.values[a], sampler.values[out_tangent],
+                                    sampler.values[b], sampler.values[in_tangent], t, dt);
+                }
+                if (!std::isfinite(value))
+                    return std::unexpected(AnimationError{"morph-weight evaluation produced a non-finite value"});
+                target.morph_weights[component] = value;
+            }
+            continue;
+        }
         Vec3 value3{};
         Vec4 value4{};
         if (left == right || sampler.interpolation == Interpolation::step) {
@@ -176,7 +198,6 @@ evaluate_animation(const Animation& animation, std::span<const Node> nodes, floa
             }
         }
 
-        auto& target = pose[channel.node];
         switch (channel.path) {
         case AnimationPath::translation: target.translation = value3; break;
         case AnimationPath::rotation: target.rotation = normalize(value4); break;

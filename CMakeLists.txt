@@ -334,6 +334,20 @@ if(BUILD_TESTING)
     astra_enable_test_assertions(astra_gltf_validation_tests)
     add_test(NAME astra.gltf_validation COMMAND astra_gltf_validation_tests)
 
+    if(APPLE)
+        add_executable(astra_morph_gpu_tests tests/metal_morph_tests.mm)
+        add_dependencies(astra_morph_gpu_tests AstraMetalShaders)
+        target_compile_definitions(astra_morph_gpu_tests PRIVATE
+            ASTRA_METALLIB_PATH="${ASTRA_METAL_SHADER_LIBRARY}"
+        )
+        target_compile_options(astra_morph_gpu_tests PRIVATE -Wall -Wextra -Wpedantic -fobjc-arc)
+        target_link_libraries(astra_morph_gpu_tests PRIVATE AstraMetal "-framework Foundation"
+            "-framework Metal" "-framework QuartzCore")
+        astra_enable_test_assertions(astra_morph_gpu_tests)
+        add_test(NAME astra.morph_gpu COMMAND astra_morph_gpu_tests)
+        set_tests_properties(astra.morph_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
     add_executable(astra_gltf_asset_smoke engine/assets/tests/gltf_asset_smoke.cpp)
     target_link_libraries(astra_gltf_asset_smoke PRIVATE Astra::Assets)
     target_compile_definitions(astra_gltf_asset_smoke PRIVATE
@@ -341,6 +355,7 @@ if(BUILD_TESTING)
         ASTRA_PLAYER_ASSET_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/characters/AstraPlayer-runtime.glb"
         ASTRA_BOAR_ASSET_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/characters/Boarbound.glb"
         ASTRA_BOAR_HUMAN_ASSET_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/characters/Boarbound-Human.glb"
+        ASTRA_ANIMATED_BOAR_ASSET_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/characters/AstraBoar.glb"
         ASTRA_NATURE_ASSET_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/assets/nature/runtime"
         ASTRA_TERRAIN_ASSET_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/assets/terrain/forest_ground_04"
     )
@@ -375,13 +390,13 @@ if(ASTRA_BUILD_EXAMPLES)
         )
         target_compile_options(astra_windowed_3d_scene PRIVATE -Wall -Wextra -Wpedantic)
 
-        add_executable(astra_boar_transformation examples/boar_transformation/main.cpp)
-        target_link_libraries(astra_boar_transformation PRIVATE Astra::Core Astra::Game Astra::Assets)
-        target_compile_definitions(astra_boar_transformation PRIVATE
-            ASTRA_BOAR_ASSET_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/characters/Boarbound.glb"
+        add_executable(astra_character_asset_inspection examples/boar_transformation/main.cpp)
+        target_link_libraries(astra_character_asset_inspection PRIVATE Astra::Core Astra::Game Astra::Assets)
+        target_compile_definitions(astra_character_asset_inspection PRIVATE
+            ASTRA_BOAR_ASSET_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/characters/AstraBoar.glb"
             ASTRA_BOAR_HUMAN_ASSET_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/characters/Boarbound-Human.glb"
         )
-        target_compile_options(astra_boar_transformation PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(astra_character_asset_inspection PRIVATE -Wall -Wextra -Wpedantic)
 
         add_executable(astra_oit_demo examples/oit/main.cpp)
         target_link_libraries(astra_oit_demo PRIVATE Astra::Core Astra::Game)

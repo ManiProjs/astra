@@ -1,4 +1,5 @@
 #include <astra/assets/gltf.hpp>
+#include <astra/assets/animation.hpp>
 
 #include <array>
 #include <cassert>
@@ -80,6 +81,45 @@ void write_occlusion_fixture(const std::filesystem::path& json_path) {
                "\"images\":[{\"uri\":\"data:application/octet-stream;base64,AA==\"}],"
                "\"textures\":[{\"source\":0}],"
                "\"materials\":[{\"occlusionTexture\":{\"index\":0,\"strength\":0.25}}]}");
+}
+
+void write_morph_fixture(const std::filesystem::path& json_path,
+                         const std::filesystem::path& bin_path,
+                         const std::string& mesh_weights, const std::string& node_weights) {
+    const std::array<float, 45> values{
+        0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F,
+        0.0F, 0.0F, 0.2F, 0.0F, 0.0F, 0.2F, 0.0F, 0.0F, 0.2F,
+        0.0F, 0.1F, 0.0F, 0.0F, 0.1F, 0.0F, 0.0F, 0.1F, 0.0F,
+        0.0F, 1.0F, 0.0F, 0.0F, 1.0F, 1.0F,
+        0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+        0.0F, 0.0F, 1.0F, 1.0F, 0.0F, 0.0F};
+    {
+        std::ofstream output(bin_path, std::ios::binary);
+        output.write(reinterpret_cast<const char*>(values.data()), sizeof(values));
+    }
+    write_file(json_path,
+        "{\"asset\":{\"version\":\"2.0\"},\"buffers\":[{\"uri\":\"" +
+        bin_path.filename().string() + "\",\"byteLength\":180}],"
+        "\"bufferViews\":[{\"buffer\":0,\"byteLength\":36},"
+        "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":36},"
+        "{\"buffer\":0,\"byteOffset\":72,\"byteLength\":36},"
+        "{\"buffer\":0,\"byteOffset\":108,\"byteLength\":8},"
+        "{\"buffer\":0,\"byteOffset\":116,\"byteLength\":16},"
+        "{\"buffer\":0,\"byteOffset\":132,\"byteLength\":48}],"
+        "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+        "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+        "{\"bufferView\":2,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+        "{\"bufferView\":3,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\"},"
+        "{\"bufferView\":4,\"componentType\":5126,\"count\":4,\"type\":\"SCALAR\"},"
+        "{\"bufferView\":5,\"componentType\":5126,\"count\":12,\"type\":\"SCALAR\"}],"
+        "\"meshes\":[{\"weights\":" + mesh_weights +
+        ",\"primitives\":[{\"attributes\":{\"POSITION\":0},\"targets\":[{\"POSITION\":1},{\"NORMAL\":2}]}]}],"
+        "\"nodes\":[{\"mesh\":0,\"weights\":" + node_weights + "}],"
+        "\"animations\":["
+        "{\"samplers\":[{\"input\":3,\"output\":4}],"
+        "\"channels\":[{\"sampler\":0,\"target\":{\"node\":0,\"path\":\"weights\"}}]},"
+        "{\"samplers\":[{\"input\":3,\"output\":5,\"interpolation\":\"CUBICSPLINE\"}],"
+        "\"channels\":[{\"sampler\":0,\"target\":{\"node\":0,\"path\":\"weights\"}}]}]}");
 }
 
 void write_sampler_material_fixture(const std::filesystem::path& json_path) {
@@ -173,10 +213,43 @@ int main() {
                "{\"asset\":{\"version\":\"2.0\"},\"samplers\":[{\"minFilter\":1234}]}");
     assert(!load_gltf(sampler_path)); // Unknown sampler enumerants are rejected.
 
+    const auto morph_path = directory / "astra_gltf_morph_test.gltf";
+    const auto morph_bin_path = directory / "astra_gltf_morph_test.bin";
+    write_morph_fixture(morph_path, morph_bin_path, "[0.25, 0.5]", "[0.75, 0.2]");
+    const auto morph_asset = load_gltf(morph_path);
+    assert(morph_asset && morph_asset->meshes.size() == 1 && morph_asset->nodes.size() == 1);
+    const auto& morph_mesh = morph_asset->meshes.front();
+    assert(morph_mesh.weights.size() == 2 && morph_mesh.weights[0] == 0.25F &&
+           morph_mesh.weights[1] == 0.5F);
+    assert(morph_asset->nodes.front().weights.size() == 2 &&
+           morph_asset->nodes.front().weights[0] == 0.75F &&
+           morph_asset->nodes.front().weights[1] == 0.2F);
+    const auto& morph = morph_mesh.primitives.front().morph_targets.front();
+    assert(morph.positions.size() == 3 && morph.normals.empty() && morph.tangents.empty());
+    assert(morph.positions[0].z == 0.2F && morph.positions[2].z == 0.2F);
+    const auto& second_morph = morph_mesh.primitives.front().morph_targets[1];
+    assert(second_morph.positions.empty() && second_morph.normals.size() == 3 &&
+           second_morph.tangents.empty());
+    assert(morph_asset->animations.size() == 2);
+    auto morph_pose = evaluate_animation(morph_asset->animations.front(),
+                                         morph_asset->nodes, 0.5F);
+    assert(morph_pose && morph_pose->front().morph_weights.size() == 2);
+    assert(std::abs(morph_pose->front().morph_weights[0] - 0.5F) < 1.0e-5F);
+    assert(std::abs(morph_pose->front().morph_weights[1] - 0.5F) < 1.0e-5F);
+    auto cubic_morph_pose = evaluate_animation(morph_asset->animations[1],
+                                              morph_asset->nodes, 0.5F);
+    assert(cubic_morph_pose && cubic_morph_pose->front().morph_weights.size() == 2);
+    assert(std::abs(cubic_morph_pose->front().morph_weights[0] - 0.5F) < 1.0e-5F);
+    assert(std::abs(cubic_morph_pose->front().morph_weights[1] - 0.5F) < 1.0e-5F);
+    write_morph_fixture(morph_path, morph_bin_path, "[0.25]", "[0.75, 0.2]");
+    assert(!load_gltf(morph_path)); // Default weight count must match the target count.
+
     std::filesystem::remove(json_path);
     std::filesystem::remove(bin_path);
     std::filesystem::remove(color_path);
     std::filesystem::remove(color_bin_path);
     std::filesystem::remove(occlusion_path);
     std::filesystem::remove(sampler_path);
+    std::filesystem::remove(morph_path);
+    std::filesystem::remove(morph_bin_path);
 }

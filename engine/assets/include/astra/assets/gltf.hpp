@@ -38,8 +38,15 @@ struct Vertex final {
 };
 
 struct Primitive final {
+    struct MorphTarget final {
+        // glTF morph attributes are vertex deltas relative to the base primitive.
+        std::vector<Vec3> positions;
+        std::vector<Vec3> normals;
+        std::vector<Vec3> tangents;
+    };
     std::vector<Vertex> vertices;
     std::vector<std::uint32_t> indices;
+    std::vector<MorphTarget> morph_targets;
     std::uint32_t material{~std::uint32_t{0}};
     bool has_joint_attributes{};
     bool has_weight_attributes{};
@@ -51,6 +58,7 @@ struct Primitive final {
 struct Mesh final {
     std::string name;
     std::vector<Primitive> primitives;
+    std::vector<float> weights;
 };
 
 struct TextureImage final {
@@ -111,6 +119,8 @@ struct Node final {
     std::vector<std::uint32_t> children;
     std::uint32_t mesh{~std::uint32_t{0}};
     std::uint32_t skin{~std::uint32_t{0}};
+    // Optional per-node override of the mesh's default morph weights.
+    std::vector<float> weights;
     Vec3 translation{};
     Vec4 rotation{0.0F, 0.0F, 0.0F, 1.0F};
     Vec3 scale{1.0F, 1.0F, 1.0F};
@@ -141,6 +151,8 @@ struct AnimationChannel final {
     std::uint32_t sampler{};
     std::uint32_t node{};
     AnimationPath path{AnimationPath::translation};
+    // Number of scalar morph weights for a weights channel; zero for TRS channels.
+    std::uint32_t weight_count{};
 };
 
 struct Animation final {

@@ -22,9 +22,9 @@ struct VegetationLodDensity final {
 [[nodiscard]] constexpr VegetationLodDensity vegetation_lod_density(TerrainLod lod) noexcept {
     switch (lod) {
     case TerrainLod::near:
-        return {5U, 120U, 2U, 4U};
+        return {5U, 720U, 2U, 4U};
     case TerrainLod::medium:
-        return {3U, 32U, 1U, 2U};
+        return {3U, 240U, 1U, 2U};
     case TerrainLod::far:
         return {1U, 0U, 0U, 0U};
     }

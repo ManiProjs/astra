@@ -71,6 +71,12 @@ struct PackedStaticMeshVertex final {
   std::uint16_t texcoord1[2];
 };
 
+struct PackedMorphDelta final {
+  float position[4];
+  float normal[4];
+  float tangent[4];
+};
+
 static_assert(sizeof(rhi::MeshVertex) == 96);
 static_assert(sizeof(PackedMeshVertex) == 52);
 static_assert(offsetof(PackedMeshVertex, position) == 0);
@@ -88,6 +94,7 @@ static_assert(offsetof(PackedStaticMeshVertex, color) == 20);
 static_assert(offsetof(PackedStaticMeshVertex, texcoord0) == 24);
 static_assert(offsetof(PackedStaticMeshVertex, tangent) == 28);
 static_assert(offsetof(PackedStaticMeshVertex, texcoord1) == 32);
+static_assert(sizeof(PackedMorphDelta) == 48);
 
 std::int16_t pack_snorm16(float value) {
   return static_cast<std::int16_t>(std::lround(std::clamp(value, -1.0F, 1.0F) * 32767.0F));
@@ -234,6 +241,12 @@ struct BoundsSphere final {
 
 struct SkinBufferCacheEntry final {
   const rhi::Matrix4* data{};
+  std::size_t count{};
+  __strong id<MTLBuffer> buffer{};
+};
+
+struct MorphWeightBufferCacheEntry final {
+  const float* data{};
   std::size_t count{};
   __strong id<MTLBuffer> buffer{};
 };
@@ -412,14 +425,46 @@ rhi::RenderError make_error(rhi::RenderErrorCode code, NSString* message) {
 class MetalMesh final : public rhi::GpuMesh {
 public:
   MetalMesh(id<MTLBuffer> vertices, id<MTLBuffer> indices, NSUInteger index_count,
-            BoundsSphere bounds, bool skinned)
+            BoundsSphere bounds, bool skinned, id<MTLBuffer> morph_deltas,
+            NSUInteger morph_target_count, NSUInteger vertex_count,
+            std::vector<float> morph_delta_radii)
       : vertices_(vertices), indices_(indices), index_count_(index_count), bounds_(bounds),
-        skinned_(skinned) {}
+        skinned_(skinned), morph_deltas_(morph_deltas),
+        morph_target_count_(morph_target_count), vertex_count_(vertex_count),
+        morph_delta_radii_(std::move(morph_delta_radii)) {}
   id<MTLBuffer> vertices() const noexcept { return vertices_; }
   id<MTLBuffer> indices() const noexcept { return indices_; }
   NSUInteger index_count() const noexcept { return index_count_; }
   const BoundsSphere& bounds() const noexcept { return bounds_; }
+  BoundsSphere bounds(std::span<const float> weights) const noexcept {
+    BoundsSphere result = bounds_;
+    const float expansion = rhi::morph_displacement_bound(morph_delta_radii_, weights);
+    result.radius += expansion;
+    result.origin_radius += expansion;
+    return result;
+  }
+  BoundsSphere bounds_for_instances(std::span<const float> weights) const noexcept {
+    if (weights.empty() || morph_target_count_ == 0U)
+      return bounds_;
+    const auto target_count = static_cast<std::size_t>(morph_target_count_);
+    if (weights.size() % target_count != 0U) {
+      BoundsSphere result = bounds_;
+      result.radius = result.origin_radius = std::numeric_limits<float>::infinity();
+      return result;
+    }
+    float maximum_expansion = 0.0F;
+    for (std::size_t offset = 0; offset < weights.size(); offset += target_count)
+      maximum_expansion = std::max(maximum_expansion,
+          rhi::morph_displacement_bound(morph_delta_radii_, weights.subspan(offset, target_count)));
+    BoundsSphere result = bounds_;
+    result.radius += maximum_expansion;
+    result.origin_radius += maximum_expansion;
+    return result;
+  }
   bool skinned() const noexcept { return skinned_; }
+  id<MTLBuffer> morph_deltas() const noexcept { return morph_deltas_; }
+  NSUInteger morph_target_count() const noexcept { return morph_target_count_; }
+  NSUInteger vertex_count() const noexcept { return vertex_count_; }
 
 private:
   __strong id<MTLBuffer> vertices_;
@@ -427,6 +472,10 @@ private:
   NSUInteger index_count_{};
   BoundsSphere bounds_{};
   bool skinned_{};
+  __strong id<MTLBuffer> morph_deltas_;
+  NSUInteger morph_target_count_{};
+  NSUInteger vertex_count_{};
+  std::vector<float> morph_delta_radii_;
 };
 
 class MetalVirtualGeometry final : public rhi::GpuVirtualGeometry {
@@ -566,7 +615,9 @@ CascadedShadowData build_shadow_cascades(const rhi::SceneSettings& settings,
         const auto* mesh = dynamic_cast<const MetalMesh*>(item.mesh);
         if (mesh == nullptr)
           continue;
-        local_bounds = mesh->bounds();
+        local_bounds = item.instance_morph_weights.empty()
+            ? mesh->bounds(item.morph_weights)
+            : mesh->bounds_for_instances(item.instance_morph_weights);
         if (!item.joint_matrices.empty()) {
           float skinned_radius = 0.0F;
           for (const auto& joint : item.joint_matrices) {
@@ -666,6 +717,7 @@ struct SceneUniforms final {
   float light_view_projection[shadow_cascade_count][16];
   float camera_position[4];
   float light_direction[4];
+  float light_radiance[4];
   float material[4];
   float base_color[4];
   float emissive[4];
@@ -684,6 +736,7 @@ struct SceneUniforms final {
   float uv_transform[5][4]; // offset.xy, scale.xy
   float uv_rotation[5][4];  // cos(rotation), sin(rotation), reserved, reserved
   float environment_flags[4]; // enabled, maximum prefilter mip, reserved, reserved
+  std::uint32_t morph_flags[4]; // target count, per-instance weights, vertex count, reserved
 };
 
 struct alignas(16) IblDispatchUniforms final {
@@ -717,18 +770,19 @@ static_assert(offsetof(rhi::MeshVertex, texcoord1_u) == 48);
 static_assert(offsetof(rhi::MeshVertex, tangent_x) == 56);
 static_assert(offsetof(rhi::MeshVertex, joints) == 72);
 static_assert(offsetof(rhi::MeshVertex, weights) == 80);
-static_assert(sizeof(SceneUniforms) == 864);
-static_assert(offsetof(SceneUniforms, texcoord_sets0) == 464);
-static_assert(offsetof(SceneUniforms, texcoord_sets1) == 480);
-static_assert(offsetof(SceneUniforms, alpha_flags) == 496);
-static_assert(offsetof(SceneUniforms, cascade_splits) == 512);
-static_assert(offsetof(SceneUniforms, cascade_camera_forward) == 528);
-static_assert(offsetof(SceneUniforms, previous_view_projection) == 544);
-static_assert(offsetof(SceneUniforms, previous_model) == 608);
-static_assert(offsetof(SceneUniforms, temporal_params) == 672);
-static_assert(offsetof(SceneUniforms, uv_transform) == 688);
-static_assert(offsetof(SceneUniforms, uv_rotation) == 768);
-static_assert(offsetof(SceneUniforms, environment_flags) == 848);
+static_assert(sizeof(SceneUniforms) == 896);
+static_assert(offsetof(SceneUniforms, texcoord_sets0) == 480);
+static_assert(offsetof(SceneUniforms, texcoord_sets1) == 496);
+static_assert(offsetof(SceneUniforms, alpha_flags) == 512);
+static_assert(offsetof(SceneUniforms, cascade_splits) == 528);
+static_assert(offsetof(SceneUniforms, cascade_camera_forward) == 544);
+static_assert(offsetof(SceneUniforms, previous_view_projection) == 560);
+static_assert(offsetof(SceneUniforms, previous_model) == 624);
+static_assert(offsetof(SceneUniforms, temporal_params) == 688);
+static_assert(offsetof(SceneUniforms, uv_transform) == 704);
+static_assert(offsetof(SceneUniforms, uv_rotation) == 784);
+static_assert(offsetof(SceneUniforms, environment_flags) == 864);
+static_assert(offsetof(SceneUniforms, morph_flags) == 880);
 static_assert(sizeof(IblDispatchUniforms) == 32);
 static_assert(sizeof(SkyUniforms) == 256);
 static_assert(offsetof(TaaUniforms, camera_position) == 64);
@@ -1261,6 +1315,19 @@ public:
             .message = "A mesh index references a vertex outside the vertex array."});
       }
     }
+    if (auto valid_morphs = rhi::validate_morph_targets(data.vertices.size(), data.morph_targets);
+        !valid_morphs) {
+      return std::unexpected(rhi::RenderError{
+          .code = rhi::RenderErrorCode::invalid_mesh,
+          .message = valid_morphs.error()});
+    }
+    if (!data.morph_targets.empty() &&
+        data.vertices.size() > std::numeric_limits<std::size_t>::max() /
+                                   data.morph_targets.size() / sizeof(PackedMorphDelta)) {
+      return std::unexpected(rhi::RenderError{
+          .code = rhi::RenderErrorCode::invalid_mesh,
+          .message = "Morph target data exceeds the addressable GPU buffer size."});
+    }
     const bool skinned = std::ranges::any_of(data.vertices, [](const rhi::MeshVertex& vertex) {
       return vertex.weights[0] > 0.0F || vertex.weights[1] > 0.0F ||
              vertex.weights[2] > 0.0F || vertex.weights[3] > 0.0F;
@@ -1280,14 +1347,52 @@ public:
     id<MTLBuffer> indices = [device_ newBufferWithBytes:data.indices.data()
                                                  length:data.indices.size_bytes()
                                                 options:MTLResourceStorageModeShared];
-    if (vertices == nil || indices == nil) {
+    id<MTLBuffer> morph_deltas = nil;
+    std::vector<float> morph_delta_radii;
+    if (!data.morph_targets.empty()) {
+      morph_delta_radii.reserve(data.morph_targets.size());
+      const std::size_t delta_count = data.vertices.size() * data.morph_targets.size();
+      morph_deltas = [device_ newBufferWithLength:delta_count * sizeof(PackedMorphDelta)
+                                          options:MTLResourceStorageModeShared];
+      if (morph_deltas != nil) {
+        auto* packed = static_cast<PackedMorphDelta*>(morph_deltas.contents);
+        for (std::size_t target_index = 0; target_index < data.morph_targets.size(); ++target_index) {
+          const auto& target = data.morph_targets[target_index];
+          float maximum_position_delta = 0.0F;
+          for (const auto& delta : target.positions)
+            maximum_position_delta = std::max(maximum_position_delta,
+                std::sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z));
+          morph_delta_radii.push_back(maximum_position_delta);
+          for (std::size_t vertex_index = 0; vertex_index < data.vertices.size(); ++vertex_index) {
+            auto& delta = packed[target_index * data.vertices.size() + vertex_index];
+            delta = {};
+            const auto write = [](float* output, std::span<const rhi::Vec3> source,
+                                  std::size_t index) {
+              if (!source.empty()) {
+                output[0] = source[index].x;
+                output[1] = source[index].y;
+                output[2] = source[index].z;
+              }
+            };
+            write(delta.position, target.positions, vertex_index);
+            write(delta.normal, target.normals, vertex_index);
+            write(delta.tangent, target.tangents, vertex_index);
+          }
+        }
+      }
+    }
+    if (vertices == nil || indices == nil || (!data.morph_targets.empty() && morph_deltas == nil)) {
       return std::unexpected(
           rhi::RenderError{.code = rhi::RenderErrorCode::resource_creation_failed,
-                           .message = "Metal could not allocate the mesh vertex or index buffer."});
+                           .message = "Metal could not allocate the mesh vertex, index, or morph buffer."});
     }
     return std::unique_ptr<rhi::GpuMesh>{new MetalMesh{vertices, indices,
                                                        static_cast<NSUInteger>(data.indices.size()),
-                                                       mesh_bounds(data.vertices), skinned}};
+                                                       mesh_bounds(data.vertices), skinned,
+                                                       morph_deltas,
+                                                       static_cast<NSUInteger>(data.morph_targets.size()),
+                                                       static_cast<NSUInteger>(data.vertices.size()),
+                                                       std::move(morph_delta_radii)}};
   }
 
   std::expected<std::unique_ptr<rhi::GpuTexture>, rhi::RenderError>
@@ -1782,6 +1887,9 @@ private:
     uniforms.light_direction[0] = settings.light_direction.x;
     uniforms.light_direction[1] = settings.light_direction.y;
     uniforms.light_direction[2] = settings.light_direction.z;
+    uniforms.light_radiance[0] = settings.directional_light_radiance.x;
+    uniforms.light_radiance[1] = settings.directional_light_radiance.y;
+    uniforms.light_radiance[2] = settings.directional_light_radiance.z;
     uniforms.material[0] = item.metallic;
     uniforms.material[1] = item.roughness;
     const auto set_color = [](float* target, rhi::Color color) {
@@ -1967,7 +2075,7 @@ private:
         BoundsSphere bounds{};
         if (item.mesh != nullptr) {
           const auto* mesh = static_cast<const MetalMesh*>(item.mesh);
-          bounds = mesh->bounds();
+          bounds = mesh->bounds(item.morph_weights);
         } else if (item.virtual_geometry != nullptr) {
           const auto* geometry = static_cast<const MetalVirtualGeometry*>(item.virtual_geometry);
           bounds = geometry->bounds();
@@ -2028,10 +2136,54 @@ private:
           item.virtual_geometry != nullptr
               ? static_cast<const MetalVirtualGeometry*>(item.virtual_geometry)
               : nullptr;
+      const std::size_t morph_target_count = mesh != nullptr ? mesh->morph_target_count() : 0U;
+      if ((mesh == nullptr && (!item.morph_weights.empty() ||
+                               !item.previous_morph_weights.empty() ||
+                               !item.instance_morph_weights.empty() ||
+                               !item.previous_instance_morph_weights.empty())) ||
+          (mesh == nullptr && !item.instance_transforms.empty()) ||
+          item.instance_transforms.size() > std::numeric_limits<std::uint32_t>::max() ||
+          (!item.previous_instance_transforms.empty() &&
+           item.previous_instance_transforms.size() != item.instance_transforms.size()) ||
+          (!item.instance_morph_weights.empty() &&
+           (!item.morph_weights.empty() || !item.previous_morph_weights.empty())) ||
+          (!item.morph_weights.empty() && item.morph_weights.size() != morph_target_count) ||
+          (!item.previous_morph_weights.empty() &&
+           (item.morph_weights.empty() || item.previous_morph_weights.size() != morph_target_count)) ||
+          (!item.instance_morph_weights.empty() &&
+           (item.instance_transforms.empty() || morph_target_count == 0U ||
+            item.instance_transforms.size() > std::numeric_limits<std::size_t>::max() /
+                                                 morph_target_count ||
+            item.instance_morph_weights.size() !=
+                item.instance_transforms.size() * morph_target_count)) ||
+          (!item.previous_instance_morph_weights.empty() &&
+           (item.instance_morph_weights.empty() || item.instance_transforms.empty() ||
+            morph_target_count == 0U ||
+            item.instance_transforms.size() > std::numeric_limits<std::size_t>::max() /
+                                                 morph_target_count ||
+            item.previous_instance_morph_weights.size() !=
+                item.instance_transforms.size() * morph_target_count)) ||
+          !rhi::morph_weights_are_finite(item.morph_weights) ||
+          !rhi::morph_weights_are_finite(item.previous_morph_weights) ||
+          !rhi::morph_weights_are_finite(item.instance_morph_weights) ||
+          !rhi::morph_weights_are_finite(item.previous_instance_morph_weights))
+        return false;
       std::span<const rhi::Matrix4> instance_models = item.instance_transforms;
-      std::span<const rhi::Matrix4> previous_instance_models = item.previous_instance_transforms;
+      std::span<const rhi::Matrix4> previous_instance_models = rhi::previous_frame_span(
+          item.instance_transforms, item.previous_instance_transforms, item.has_previous_transform);
+      std::span<const float> current_morph_weights = item.instance_morph_weights.empty()
+          ? item.morph_weights : item.instance_morph_weights;
+      const bool per_instance_morph_weights = !item.instance_morph_weights.empty();
+      std::span<const float> previous_morph_weights = per_instance_morph_weights
+          ? rhi::previous_frame_span(item.instance_morph_weights,
+                                     item.previous_instance_morph_weights,
+                                     item.has_previous_transform)
+          : rhi::previous_frame_span(item.morph_weights, item.previous_morph_weights,
+                                     item.has_previous_transform);
       if (!instance_models.empty()) {
-        const auto local_bounds = mesh->bounds();
+        const auto shared_local_bounds = per_instance_morph_weights
+            ? mesh->bounds()
+            : mesh->bounds(item.morph_weights);
         auto& visible_instances = next_instance_cull_scratch();
         visible_instances.reserve(instance_models.size());
         const bool has_distinct_previous = !previous_instance_models.empty() &&
@@ -2041,8 +2193,24 @@ private:
           visible_previous = &next_instance_cull_scratch();
           visible_previous->reserve(previous_instance_models.size());
         }
+        std::vector<float>* visible_morph_weights = nullptr;
+        std::vector<float>* visible_previous_morph_weights = nullptr;
+        std::vector<std::uint32_t> visible_instance_indices;
+        if (per_instance_morph_weights) {
+          visible_morph_weights = &next_instance_morph_scratch();
+          visible_morph_weights->reserve(item.instance_morph_weights.size());
+          visible_instance_indices.reserve(instance_models.size());
+          if (item.has_previous_transform && !item.previous_instance_morph_weights.empty()) {
+            visible_previous_morph_weights = &next_instance_morph_scratch();
+            visible_previous_morph_weights->reserve(item.previous_instance_morph_weights.size());
+          }
+        }
         for (std::size_t instance_index = 0; instance_index < instance_models.size();
              ++instance_index) {
+          const auto local_bounds = per_instance_morph_weights
+              ? mesh->bounds(item.instance_morph_weights.subspan(
+                    instance_index * morph_target_count, morph_target_count))
+              : shared_local_bounds;
           const auto combined_model = multiply(instance_models[instance_index], item.model);
           const Vec4 world_center = transform(
               combined_model,
@@ -2053,6 +2221,8 @@ private:
                   culling_matrix, {world_center.x, world_center.y, world_center.z}, world_radius))
             continue;
           visible_instances.push_back(instance_models[instance_index]);
+          if (per_instance_morph_weights)
+            visible_instance_indices.push_back(static_cast<std::uint32_t>(instance_index));
           if (visible_previous != nullptr && instance_index < previous_instance_models.size())
             visible_previous->push_back(previous_instance_models[instance_index]);
         }
@@ -2063,6 +2233,21 @@ private:
           previous_instance_models = *visible_previous;
         else
           previous_instance_models = instance_models;
+        if (visible_morph_weights != nullptr) {
+          const auto compacted = rhi::compact_instance_morph_weights(
+              item.instance_morph_weights,
+              visible_previous_morph_weights != nullptr
+                  ? item.previous_instance_morph_weights : std::span<const float>{},
+              visible_instance_indices, morph_target_count,
+              *visible_morph_weights, visible_previous_morph_weights);
+          if (!compacted)
+            return false;
+          current_morph_weights = *visible_morph_weights;
+        }
+        if (visible_previous_morph_weights != nullptr)
+          previous_morph_weights = *visible_previous_morph_weights;
+        else if (per_instance_morph_weights)
+          previous_morph_weights = current_morph_weights;
       }
       const NSUInteger argument_offset =
           shadow_pass ? 0U : (*fragment_argument_cursor)++ * fragment_argument_stride;
@@ -2078,6 +2263,10 @@ private:
                                         : (blended ? transparent_depth_state_ : depth_state_)];
       SceneUniforms uniforms = make_scene_uniforms(item, view_projection, settings, shadows);
       uniforms.scene_params[3] = static_cast<float>(cascade_index);
+      const bool has_morph_weights = !current_morph_weights.empty();
+      uniforms.morph_flags[0] = has_morph_weights ? static_cast<std::uint32_t>(morph_target_count) : 0U;
+      uniforms.morph_flags[1] = per_instance_morph_weights ? 1U : 0U;
+      uniforms.morph_flags[2] = mesh != nullptr ? static_cast<std::uint32_t>(mesh->vertex_count()) : 0U;
       [encoder setVertexBuffer:mesh != nullptr ? mesh->vertices() : virtual_geometry->vertices()
                         offset:0
                        atIndex:0];
@@ -2129,6 +2318,34 @@ private:
         [encoder setVertexBuffer:previous_instance_buffer offset:0 atIndex:5];
       else
         [encoder setVertexBytes:&identity_instance length:sizeof(identity_instance) atIndex:5];
+      id<MTLBuffer> current_morph_buffer = has_morph_weights
+          ? morph_weight_buffer(current_morph_weights) : nil;
+      id<MTLBuffer> previous_morph_buffer = has_morph_weights
+          ? morph_weight_buffer(previous_morph_weights) : nil;
+      if (has_morph_weights && (current_morph_buffer == nil || previous_morph_buffer == nil ||
+                                mesh == nullptr || mesh->morph_deltas() == nil ||
+                                current_morph_weights.size() !=
+                                    (per_instance_morph_weights
+                                         ? instance_models.size() * morph_target_count
+                                         : morph_target_count) ||
+                                previous_morph_weights.size() != current_morph_weights.size())) {
+        [encoder endEncoding];
+        return false;
+      }
+      const float zero_weight = 0.0F;
+      const PackedMorphDelta zero_delta{};
+      if (current_morph_buffer != nil)
+        [encoder setVertexBuffer:current_morph_buffer offset:0 atIndex:6];
+      else
+        [encoder setVertexBytes:&zero_weight length:sizeof(zero_weight) atIndex:6];
+      if (previous_morph_buffer != nil)
+        [encoder setVertexBuffer:previous_morph_buffer offset:0 atIndex:7];
+      else
+        [encoder setVertexBytes:&zero_weight length:sizeof(zero_weight) atIndex:7];
+      if (mesh != nullptr && mesh->morph_deltas() != nil)
+        [encoder setVertexBuffer:mesh->morph_deltas() offset:0 atIndex:8];
+      else
+        [encoder setVertexBytes:&zero_delta length:sizeof(zero_delta) atIndex:8];
       [encoder setVertexBytes:&uniforms length:sizeof(SceneUniforms) atIndex:1];
       if (shadow_pass) {
         const auto* base_texture =
@@ -2258,10 +2475,36 @@ private:
     return buffer;
   }
 
+  id<MTLBuffer> morph_weight_buffer(std::span<const float> weights) {
+    if (weights.empty())
+      return nil;
+    const auto cached = std::find_if(
+        morph_weight_buffer_cache_.begin(), morph_weight_buffer_cache_.end(),
+        [&weights](const auto& entry) {
+          return entry.data == weights.data() && entry.count == weights.size();
+        });
+    if (cached != morph_weight_buffer_cache_.end())
+      return cached->buffer;
+    id<MTLBuffer> buffer = [device_ newBufferWithBytes:weights.data()
+                                                length:weights.size_bytes()
+                                               options:MTLResourceStorageModeShared];
+    if (buffer != nil)
+      morph_weight_buffer_cache_.push_back({weights.data(), weights.size(), buffer});
+    return buffer;
+  }
+
   std::vector<rhi::Matrix4>& next_instance_cull_scratch() {
     if (instance_cull_scratch_cursor_ == instance_cull_scratch_.size())
       instance_cull_scratch_.emplace_back();
     auto& result = instance_cull_scratch_[instance_cull_scratch_cursor_++];
+    result.clear();
+    return result;
+  }
+
+  std::vector<float>& next_instance_morph_scratch() {
+    if (instance_morph_scratch_cursor_ == instance_morph_scratch_.size())
+      instance_morph_scratch_.emplace_back();
+    auto& result = instance_morph_scratch_[instance_morph_scratch_cursor_++];
     result.clear();
     return result;
   }
@@ -2273,8 +2516,11 @@ private:
     @autoreleasepool {
       // One immutable skin-palette upload can serve every primitive and render pass this frame.
       skin_buffer_cache_.clear();
+      morph_weight_buffer_cache_.clear();
       instance_cull_scratch_cursor_ = 0;
-      instance_cull_scratch_.reserve(draw_items.size() * (shadow_cascade_count + 1U) * 2U + 8U);
+      instance_morph_scratch_cursor_ = 0;
+      instance_cull_scratch_.reserve(draw_items.size() * (shadow_cascade_count + 2U) * 2U + 8U);
+      instance_morph_scratch_.reserve(draw_items.size() * (shadow_cascade_count + 2U) * 2U + 8U);
       id<CAMetalDrawable> drawable = [layer_ nextDrawable];
       if (drawable == nil) {
         history_valid_ = false;
@@ -2724,8 +2970,11 @@ private:
   };
   std::vector<SamplerCacheEntry> sampler_cache_;
   std::vector<SkinBufferCacheEntry> skin_buffer_cache_;
+  std::vector<MorphWeightBufferCacheEntry> morph_weight_buffer_cache_;
   std::vector<std::vector<rhi::Matrix4>> instance_cull_scratch_;
   std::size_t instance_cull_scratch_cursor_{};
+  std::vector<std::vector<float>> instance_morph_scratch_;
+  std::size_t instance_morph_scratch_cursor_{};
   std::array<__strong id<MTLTexture>, shadow_cascade_count> shadow_textures_;
   __strong id<MTLTexture> hdr_texture_;
   __strong id<MTLTexture> velocity_texture_;

@@ -1,0 +1,9 @@
+Geometry source: 3DAssets.dev Forest Boar (CC0 1.0)
+Rig/animation source: Gobkit WildBoar (CC0 1.0)
+Vertices: 483,044
+Triangles: 966,016
+Rig bones: 16 source bones (11 with transferred vertex weights)
+Exported glTF skin joints: 13
+Animations: 4
+Maximum nearest-weight transfer distance in rig space: 1.450288
+Texture: 1024x1024 generated hide

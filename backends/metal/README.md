@@ -9,11 +9,15 @@ pipeline for virtual-geometry selection and culling.
 The scene path supports indexed meshes, RGBA8 textures with sRGB/linear formats
 and generated mipmaps, UV0/UV1, glTF per-texture sampler state, tangent-space
 normal maps, metallic/roughness, occlusion and emissive maps, alpha masking,
-sorted alpha blending, double-sided normal handling, GPU skinning, GGX/Schlick
-direct lighting, analytic sky-environment lighting, three 2048² directional
-shadow cascades with PCF and blended transitions, an RGBA16F scene target,
-bounded 3D ray-marched cloud and fog volumes, and ACES tone mapping to an sRGB
-drawable. Temporal AA uses an eight-sample Halton projection jitter, scene/sky
+weighted blended order-independent transparency, double-sided normal handling,
+GPU skinning/morphing, GGX/Schlick direct lighting with configurable directional
+light radiance, three 16-bit directional shadow cascades (1024²/768²/384²) with
+PCF and blended transitions, an RGBA16F scene target, bounded 3D ray-marched
+cloud and fog approximations, and ACES-fitted tone mapping to an sRGB drawable.
+The backend also supports equirectangular HDR environment conversion, diffuse
+irradiance convolution, GGX specular prefiltering and a split-sum BRDF LUT; an
+environment can be assigned through `SceneSettings`. Temporal AA uses an
+eight-sample Halton projection jitter, scene/sky
 RGBA16F motion/reactive data, finite-cloud representative-point reprojection,
 ping-pong HDR color/linear-distance history, previous-camera-aware depth
 rejection, and a 3x3 neighborhood clamp before tone mapping. Transparent
@@ -43,13 +47,13 @@ The per-frame Metal pass sequence is compiled and executed through
 Imported backend-owned resources participate in hazard ordering and lifetime
 tracking.
 
-This is not yet a production renderer. It has no prefiltered HDR environment
-map or full image-based lighting, no HDR/EDR display output, and no temporal
-upscaling or dynamic resolution. Cloud and fog volumes use a small fixed
+This is not yet a production renderer. It has no screen-space AO, local point/spot
+lights, dynamic GI, screen-space reflections, reflection probes, automatic
+exposure, bloom, color grading, or HDR/EDR display output. TAA is not a temporal
+upscaler. Cloud and fog volumes use a small fixed
 ray-march sample count rather than a temporally accumulated 3D density
 simulation. Transparent sorting is object-center back-to-front and does not
 solve intersecting transparency or order-independent transparency. The render
 graph does not yet allocate/alias transient resources or emit explicit backend
-barriers. Virtual geometry does not yet use Metal indirect command buffers,
-mesh shaders, GPU-generated streaming, or a production Nanite-style cluster
-compression/topology pipeline.
+barriers. Virtual geometry does not yet have GPU-feedback-driven disk streaming,
+mesh shaders, or a production Nanite-style cluster compression/topology pipeline.

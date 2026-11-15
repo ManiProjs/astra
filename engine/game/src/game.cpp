@@ -186,7 +186,11 @@ void Frame::draw(const rhi::GpuMesh& mesh, rhi::Matrix4 model, rhi::MaterialData
     item.model = model;
     item.material = material;
     item.use_material = true;
-    draw_items.push_back(item);
+    draw(std::move(item));
+}
+
+void Frame::draw(rhi::DrawItem item) {
+    draw_items.push_back(std::move(item));
 }
 
 std::expected<void, rhi::RenderError> Frame::render(rhi::Color clear_color,

@@ -18,6 +18,7 @@ struct SceneUniforms {
     float4x4 light_view_projection[3];
     float4 camera_position;
     float4 light_direction;
+    float4 light_radiance;
     float4 material;
     float4 base_color;
     float4 emissive;
@@ -36,6 +37,13 @@ struct SceneUniforms {
     float4 uv_transform[5]; // offset.xy, scale.xy
     float4 uv_rotation[5];  // cos(rotation), sin(rotation), reserved, reserved
     float4 environment_flags; // enabled, maximum prefilter mip, reserved, reserved
+    uint4 morph_flags; // target count, per-instance weights, vertex count, reserved
+};
+
+struct MorphDelta {
+    float4 position;
+    float4 normal;
+    float4 tangent;
 };
 
 float2 apply_uv_transform(float2 uv, float4 transform, float4 rotation) {
@@ -208,6 +216,126 @@ float3 transform_normal(float3x3 transform, float3 normal) {
     return (float3x3(c0, c1, c2) / determinant) * normal;
 }
 
+// All foliage passes use the same world-space deformation. Applying the offset
+// after the model transform keeps wind direction stable for rotated/scaled
+// instances and keeps camera, previous-frame and shadow silhouettes identical.
+float3 foliage_wind_offset(float3 world_anchor, float bend, float time) {
+    const float phase = time * 1.35 + world_anchor.x * 0.19 + world_anchor.z * 0.13;
+    return float3((sin(phase) * 0.10 + sin(phase * 0.47 + 1.7) * 0.055) * bend,
+                  0.0,
+                  cos(phase * 0.73) * 0.045 * bend);
+}
+
+void apply_morph_data(VertexIn input, uint vertex_id, uint instance_id,
+                      uint target_count, uint vertex_count, bool per_instance,
+                      device const float *morph_weights,
+                      device const MorphDelta *morph_deltas,
+                      thread float3 &position, thread float3 &normal,
+                      thread float3 &tangent) {
+    const uint weight_base = per_instance ? instance_id * target_count : 0U;
+    position = input.position;
+    normal = input.normal;
+    tangent = input.tangent.xyz;
+    for (uint target = 0; target < target_count; ++target) {
+        const float weight = morph_weights[weight_base + target];
+        if (abs(weight) <= 1.0e-8)
+            continue;
+        const MorphDelta delta = morph_deltas[target * vertex_count + vertex_id];
+        position += delta.position.xyz * weight;
+        normal += delta.normal.xyz * weight;
+        tangent += delta.tangent.xyz * weight;
+    }
+}
+
+void apply_morph_targets(VertexIn input, uint vertex_id, uint instance_id,
+                         constant SceneUniforms &scene,
+                         device const float *morph_weights,
+                         device const MorphDelta *morph_deltas,
+                         thread float3 &position, thread float3 &normal,
+                         thread float3 &tangent) {
+    apply_morph_data(input, vertex_id, instance_id, scene.morph_flags.x,
+                     scene.morph_flags.z, scene.morph_flags.y != 0U,
+                     morph_weights, morph_deltas, position, normal, tangent);
+}
+
+struct MorphValidationUniforms {
+    uint target_count;
+    uint vertex_count;
+    uint per_instance;
+    uint reserved;
+};
+
+struct MorphValidationOutput {
+    float4 current_position;
+    float4 previous_position;
+    float4 current_normal;
+    float4 current_tangent;
+};
+
+// A small GPU regression kernel exercises the same morph and skinning helpers
+// used by the production vertex entry points. It is built into the normal
+// metallib and invoked only by the macOS GPU test target.
+kernel void astra_morph_validation_kernel(
+    device const float4 *positions [[buffer(0)]],
+    device const float4 *normals [[buffer(1)]],
+    device const float4 *tangents [[buffer(2)]],
+    device const ushort4 *joints [[buffer(3)]],
+    device const float4 *skin_weights [[buffer(4)]],
+    device const MorphDelta *morph_deltas [[buffer(5)]],
+    device const float *current_morph_weights [[buffer(6)]],
+    device const float *previous_morph_weights [[buffer(7)]],
+    constant float4x4 *current_joint_matrices [[buffer(8)]],
+    constant float4x4 *previous_joint_matrices [[buffer(9)]],
+    constant MorphValidationUniforms &uniforms [[buffer(10)]],
+    device MorphValidationOutput *outputs [[buffer(11)]],
+    uint2 thread_id [[thread_position_in_grid]]) {
+    const uint vertex_id = thread_id.x;
+    const uint instance_id = thread_id.y;
+    VertexIn input;
+    input.position = positions[vertex_id].xyz;
+    input.normal = normals[vertex_id].xyz;
+    input.tangent = tangents[vertex_id];
+    input.joints = joints[vertex_id];
+    input.weights = skin_weights[vertex_id];
+    input.color = float4(1.0);
+    input.texcoord0 = float2(0.0);
+    input.texcoord1 = float2(0.0);
+
+    float3 current_position;
+    float3 current_normal;
+    float3 current_tangent;
+    apply_morph_data(input, vertex_id, instance_id, uniforms.target_count,
+                     uniforms.vertex_count, uniforms.per_instance != 0U,
+                     current_morph_weights, morph_deltas,
+                     current_position, current_normal, current_tangent);
+    VertexIn current_input = input;
+    current_input.position = current_position;
+    current_input.normal = current_normal;
+    current_input.tangent.xyz = current_tangent;
+
+    float3 previous_position;
+    float3 previous_normal;
+    float3 previous_tangent;
+    apply_morph_data(input, vertex_id, instance_id, uniforms.target_count,
+                     uniforms.vertex_count, uniforms.per_instance != 0U,
+                     previous_morph_weights, morph_deltas,
+                     previous_position, previous_normal, previous_tangent);
+    VertexIn previous_input = input;
+    previous_input.position = previous_position;
+    previous_input.normal = previous_normal;
+    previous_input.tangent.xyz = previous_tangent;
+
+    const uint output_index = instance_id * uniforms.vertex_count + vertex_id;
+    outputs[output_index].current_position =
+        skin_matrix_with_count(current_input, 1U, current_joint_matrices) *
+        float4(current_position, 1.0);
+    outputs[output_index].previous_position =
+        skin_matrix_with_count(previous_input, 1U, previous_joint_matrices) *
+        float4(previous_position, 1.0);
+    outputs[output_index].current_normal = float4(current_normal, 0.0);
+    outputs[output_index].current_tangent = float4(current_tangent, input.tangent.w);
+}
+
 float4 skinned_position_at_time(VertexIn input, constant SceneUniforms &scene,
                                 constant float4x4 *joint_matrices, uint joint_count, float time,
                                 float4x4 model_transform) {
@@ -242,6 +370,10 @@ vertex VertexOut astra_vertex(VertexIn input [[stage_in]],
                               constant float4x4 *previous_joint_matrices [[buffer(3)]],
                               device const float4x4 *instance_models [[buffer(4)]],
                               device const float4x4 *previous_instance_models [[buffer(5)]],
+                              device const float *morph_weights [[buffer(6)]],
+                              device const float *previous_morph_weights [[buffer(7)]],
+                              device const MorphDelta *morph_deltas [[buffer(8)]],
+                              uint vertex_id [[vertex_id]],
                               uint instance_id [[instance_id]]) {
     VertexOut out;
     float4x4 model_transform = scene.model;
@@ -253,37 +385,56 @@ vertex VertexOut astra_vertex(VertexIn input [[stage_in]],
     // Evaluate the current skin matrix once. Position, normal and tangent all
     // use the same weighted joint transform; recomputing it three times made
     // the high-vertex-count player unnecessarily expensive on integrated GPUs.
-    const float4x4 current_skin = skin_matrix(input, scene, joint_matrices);
-    float4 local_position = current_skin * float4(input.position, 1.0);
+    VertexIn current_input = input;
+    float3 current_position;
+    float3 current_normal;
+    float3 current_tangent;
+    apply_morph_targets(input, vertex_id, instance_id, scene, morph_weights, morph_deltas,
+                        current_position, current_normal, current_tangent);
+    current_input.position = current_position;
+    current_input.normal = current_normal;
+    current_input.tangent.xyz = current_tangent;
+    const float4x4 current_skin = skin_matrix(current_input, scene, joint_matrices);
+    float4 local_position = current_skin * float4(current_position, 1.0);
+    float4 world = model_transform * local_position;
     if (input.tangent.w == 0.0) {
         const float bend = clamp(input.texcoord1.y, 0.0, 1.0);
-        const float3 world_anchor = (model_transform * float4(input.position, 1.0)).xyz;
-        const float phase = scene.scene_params.x * 1.35 + world_anchor.x * 0.19 +
-                            world_anchor.z * 0.13;
-        local_position.x += (sin(phase) * 0.10 + sin(phase * 0.47 + 1.7) * 0.055) * bend;
-        local_position.z += cos(phase * 0.73) * 0.045 * bend;
+        world.xyz += foliage_wind_offset(world.xyz, bend, scene.scene_params.x);
     }
-    float4 world = model_transform * local_position;
     out.position = scene.view_projection * world;
     out.current_clip = out.position;
     out.previous_clip = out.position;
     if (scene.temporal_params.x > 0.5) {
-        const float4 previous_local_position = skinned_position_at_time(
-            input, scene, previous_joint_matrices, uint(scene.skin_flags.y), scene.temporal_params.y,
+        VertexIn previous_input = input;
+        float3 previous_position;
+        float3 previous_normal;
+        float3 previous_tangent;
+        apply_morph_targets(input, vertex_id, instance_id, scene, previous_morph_weights,
+                            morph_deltas, previous_position, previous_normal, previous_tangent);
+        previous_input.position = previous_position;
+        previous_input.normal = previous_normal;
+        previous_input.tangent.xyz = previous_tangent;
+        float4 previous_local_position = skinned_position_at_time(
+            previous_input, scene, previous_joint_matrices, uint(scene.skin_flags.y), scene.temporal_params.y,
             previous_model_transform);
-        out.previous_clip =
-            scene.previous_view_projection * previous_model_transform * previous_local_position;
+        float4 previous_world = previous_model_transform * previous_local_position;
+        if (input.tangent.w == 0.0) {
+            const float bend = clamp(input.texcoord1.y, 0.0, 1.0);
+            previous_world.xyz += foliage_wind_offset(previous_world.xyz, bend,
+                                                       scene.temporal_params.y);
+        }
+        out.previous_clip = scene.previous_view_projection * previous_world;
     }
     out.world_position = world.xyz;
     float3x3 model_3x3 = float3x3(model_transform[0].xyz, model_transform[1].xyz,
                                   model_transform[2].xyz);
     const float3x3 skin_linear = linear_part(current_skin);
-    float3 local_normal = transform_normal(skin_linear, input.normal);
+    float3 local_normal = transform_normal(skin_linear, current_normal);
     out.normal = normalize(transform_normal(model_3x3, local_normal));
     out.color = input.color;
     out.texcoord0 = input.texcoord0;
     out.texcoord1 = input.texcoord1;
-    float3 transformed_tangent = model_3x3 * skin_linear * input.tangent.xyz;
+    float3 transformed_tangent = model_3x3 * skin_linear * current_tangent;
     transformed_tangent -= out.normal * dot(out.normal, transformed_tangent);
     float tangent_length_squared = dot(transformed_tangent, transformed_tangent);
     if (tangent_length_squared > 0.000001) {
@@ -296,10 +447,8 @@ vertex VertexOut astra_vertex(VertexIn input [[stage_in]],
     }
     if (input.tangent.w == 0.0) {
         const float bend = clamp(input.texcoord1.y, 0.0, 1.0);
-        const float3 world_anchor = (scene.model * float4(input.position, 1.0)).xyz;
-        const float phase = scene.scene_params.x * 1.35 + world_anchor.x * 0.19 +
-                            world_anchor.z * 0.13;
-        const float sway = cos(phase) * 0.12 * bend;
+        const float phase = scene.scene_params.x * 1.35 + world.x * 0.19 + world.z * 0.13;
+        const float sway = cos(phase * 0.73) * 0.12 * bend;
         out.normal = normalize(out.normal + float3(-sway, 0.0, sway * 0.45));
     }
     float model_determinant = dot(model_3x3[0], cross(model_3x3[1], model_3x3[2]));
@@ -308,6 +457,12 @@ vertex VertexOut astra_vertex(VertexIn input [[stage_in]],
     float skin_sign = abs(skin_determinant) < 0.000001 ? 1.0 : sign(skin_determinant);
     out.tangent_sign = (input.tangent.w == 0.0 ? 1.0 : input.tangent.w) * model_sign * skin_sign;
     return out;
+}
+
+fragment float4 astra_morph_validation_fragment(VertexOut input [[stage_in]]) {
+    const float4 current = input.current_clip / max(input.current_clip.w, 1.0e-6);
+    const float4 previous = input.previous_clip / max(input.previous_clip.w, 1.0e-6);
+    return float4(current.xy, previous.xy);
 }
 
 struct ShadowVertexOut {
@@ -321,18 +476,38 @@ vertex ShadowVertexOut astra_shadow_vertex(VertexIn input [[stage_in]],
                                            constant SceneUniforms &scene [[buffer(1)]],
                                            constant float4x4 *joint_matrices [[buffer(2)]],
                                            device const float4x4 *instance_models [[buffer(4)]],
+                                           device const float *morph_weights [[buffer(6)]],
+                                           device const MorphDelta *morph_deltas [[buffer(8)]],
+                                           uint vertex_id [[vertex_id]],
                                            uint instance_id [[instance_id]]) {
     float4x4 model_transform = scene.model;
     if (scene.texture_flags2.w > 0.5)
         model_transform = instance_models[instance_id] * scene.model;
-    float4 local_position = skinned_position(input, scene, joint_matrices, model_transform);
+    VertexIn morphed_input = input;
+    float3 morphed_position;
+    float3 morphed_normal;
+    float3 morphed_tangent;
+    apply_morph_targets(input, vertex_id, instance_id, scene, morph_weights, morph_deltas,
+                        morphed_position, morphed_normal, morphed_tangent);
+    morphed_input.position = morphed_position;
+    morphed_input.normal = morphed_normal;
+    morphed_input.tangent.xyz = morphed_tangent;
+    float4 local_position = skinned_position(morphed_input, scene, joint_matrices, model_transform);
+    float4 world_position = model_transform * local_position;
+    if (input.tangent.w == 0.0) {
+        const float bend = clamp(input.texcoord1.y, 0.0, 1.0);
+        world_position.xyz += foliage_wind_offset(world_position.xyz, bend, scene.scene_params.x);
+    }
     ShadowVertexOut out;
-    out.position =
-        scene.light_view_projection[uint(scene.scene_params.w)] * model_transform * local_position;
+    out.position = scene.light_view_projection[uint(scene.scene_params.w)] * world_position;
     out.texcoord0 = input.texcoord0;
     out.texcoord1 = input.texcoord1;
     out.color = input.color;
     return out;
+}
+
+fragment float4 astra_morph_validation_shadow_fragment(ShadowVertexOut input [[stage_in]]) {
+    return float4(input.position.z, input.texcoord0.x, input.color.r, 1.0);
 }
 
 fragment void astra_shadow_fragment(ShadowVertexOut input [[stage_in]],
@@ -606,12 +781,6 @@ float3 fresnel_schlick(float cosine, float3 f0) {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - cosine, 0.0, 1.0), 5.0);
 }
 
-float hash_noise(float3 p) {
-    p = fract(p * 0.3183099 + float3(0.1, 0.2, 0.3));
-    p *= 17.0;
-    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
-}
-
 float shadow_pcf(float4 shadow_position, depth2d<float> shadow_map, sampler shadow_sampler,
                  float3 normal, float3 light_direction) {
     if (shadow_position.w <= 0.0)
@@ -718,9 +887,7 @@ fragment SceneFragmentOut astra_fragment(
         discard_fragment();
     float metallic = clamp(scene.material.x * mr_sample.b, 0.0, 1.0);
     float roughness = clamp(scene.material.y * mr_sample.g, 0.045, 1.0);
-    float texture_noise = (hash_noise(floor(input.world_position * 2.7)) - 0.5) * 0.055;
-    float3 albedo =
-        max(input.color.rgb * scene.base_color.rgb * base_sample.rgb * (1.0 + texture_noise), 0.0);
+    float3 albedo = max(input.color.rgb * scene.base_color.rgb * base_sample.rgb, 0.0);
     float3 f0 = mix(float3(0.04), albedo, metallic);
     float3 fresnel = fresnel_schlick(h_dot_v, f0);
     float distribution = distribution_ggx(n_dot_h, roughness);
@@ -753,7 +920,7 @@ fragment SceneFragmentOut astra_fragment(
         visibility = mix(visibility, next_visibility, blend);
     }
     float3 direct = (diffuse_weight * albedo / M_PI_F + specular) *
-                    (float3(3.8, 3.55, 3.15) * n_dot_l * visibility);
+                    (scene.light_radiance.xyz * n_dot_l * visibility);
 
     float3 sun_direction = normalize(-scene.light_direction.xyz);
     float3 reflected_direction = reflect(-v, n);
@@ -788,7 +955,7 @@ fragment SceneFragmentOut astra_fragment(
     float3 emissive = scene.emissive.rgb;
     if (scene.texture_flags2.x > 0.5)
         emissive *= resources.emissive_map.sample(resources.emissive_sampler, emissive_uv).rgb;
-    float3 color = direct + ambient + albedo * 0.018 + emissive;
+    float3 color = direct + ambient + emissive;
 
     const float3 camera_to_surface = input.world_position - scene.camera_position.xyz;
     const float distance_to_camera = length(camera_to_surface);

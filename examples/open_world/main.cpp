@@ -260,6 +260,47 @@ float random_range(std::uint32_t& state, float minimum, float maximum) {
     return minimum + (maximum - minimum) * unit;
 }
 
+std::vector<float> make_outdoor_environment(std::uint32_t width, std::uint32_t height,
+                                            Vec3 sun_direction) {
+    std::vector<float> pixels(static_cast<std::size_t>(width) * height * 4U, 1.0F);
+    sun_direction = normalize(sun_direction);
+    const auto smooth = [](float low, float high, float value) {
+        const float t = std::clamp((value - low) / (high - low), 0.0F, 1.0F);
+        return t * t * (3.0F - 2.0F * t);
+    };
+    for (std::uint32_t y = 0; y < height; ++y) {
+        const float latitude = (0.5F - (static_cast<float>(y) + 0.5F) /
+                                             static_cast<float>(height)) * kPi;
+        const float cos_latitude = std::cos(latitude);
+        for (std::uint32_t x = 0; x < width; ++x) {
+            const float longitude = ((static_cast<float>(x) + 0.5F) /
+                                         static_cast<float>(width) - 0.5F) * (2.0F * kPi);
+            const Vec3 direction{cos_latitude * std::cos(longitude), std::sin(latitude),
+                                  cos_latitude * std::sin(longitude)};
+            const float sky_elevation = smooth(-0.12F, 0.72F, direction.y);
+            const float ground_weight = smooth(0.025F, 0.42F, -direction.y);
+            const float sun_alignment = std::max(dot(direction, sun_direction), 0.0F);
+            const float solar_disc = std::pow(sun_alignment, 900.0F) * 42.0F;
+            const float solar_halo = std::pow(sun_alignment, 26.0F) * 0.42F;
+            const std::array<float, 3> sky_horizon{0.48F, 0.57F, 0.66F};
+            const std::array<float, 3> sky_zenith{0.075F, 0.19F, 0.36F};
+            const std::array<float, 3> ground{0.075F, 0.105F, 0.052F};
+            const std::array<float, 3> sun_tint{1.0F, 0.72F, 0.43F};
+            const std::size_t offset =
+                (static_cast<std::size_t>(y) * width + x) * 4U;
+            for (std::size_t channel = 0; channel < 3; ++channel) {
+                const float sky = std::lerp(sky_horizon[channel], sky_zenith[channel],
+                                            sky_elevation);
+                const float environment = std::lerp(sky, ground[channel], ground_weight);
+                pixels[offset + channel] = environment +
+                    sun_tint[channel] * (solar_disc + solar_halo);
+            }
+            pixels[offset + 3U] = 1.0F;
+        }
+    }
+    return pixels;
+}
+
 struct RuntimePrimitive final {
     std::uint32_t node{};
     std::size_t mesh_group{};
@@ -420,6 +461,10 @@ std::expected<RuntimeModel, std::string> load_runtime_model(astra::renderer::Ren
     struct MeshBuildGroup final {
         std::vector<MeshVertex> vertices;
         std::vector<std::uint32_t> indices;
+        std::vector<std::vector<Vec3>> morph_positions;
+        std::vector<std::vector<Vec3>> morph_normals;
+        std::vector<std::vector<Vec3>> morph_tangents;
+        std::vector<astra::rhi::MeshData::MorphTarget> morph_targets;
     };
     std::vector<MeshBuildGroup> mesh_groups;
     const auto same_vertex = [](const MeshVertex& a, const MeshVertex& b) {
@@ -487,7 +532,10 @@ std::expected<RuntimeModel, std::string> load_runtime_model(astra::renderer::Ren
                     // as a normalized vertical bend weight for the shared wind path.
                     vertex.texcoord1_v = std::clamp(
                         (source.position.y - primitive_min_y) / primitive_height, 0.0F, 1.0F);
-                    vertex.tangent_w = 2.0F;
+                    // Zero is the renderer's reserved vegetation-wind marker.
+                    // Keep the authored tangent xyz; the shader restores a stable
+                    // positive tangent handedness for marked foliage.
+                    vertex.tangent_w = 0.0F;
                 }
                 for (std::size_t joint = 0; joint < 4; ++joint) {
                     vertex.joints[joint] = source.joints[joint];
@@ -571,16 +619,43 @@ std::expected<RuntimeModel, std::string> load_runtime_model(astra::renderer::Ren
                     }
                 }
             }
+            std::vector<std::vector<Vec3>> morph_positions;
+            std::vector<std::vector<Vec3>> morph_normals;
+            std::vector<std::vector<Vec3>> morph_tangents;
+            morph_positions.reserve(primitive.morph_targets.size());
+            morph_normals.reserve(primitive.morph_targets.size());
+            morph_tangents.reserve(primitive.morph_targets.size());
+            for (const auto& source_target : primitive.morph_targets) {
+                morph_positions.emplace_back();
+                morph_normals.emplace_back();
+                morph_tangents.emplace_back();
+                const auto convert = [](const std::vector<astra::assets::Vec3>& source,
+                                        std::vector<Vec3>& destination) {
+                    destination.reserve(source.size());
+                    for (const auto& value : source)
+                        destination.push_back({value.x, value.y, value.z});
+                };
+                convert(source_target.positions, morph_positions.back());
+                convert(source_target.normals, morph_normals.back());
+                convert(source_target.tangents, morph_tangents.back());
+            }
             const auto group = std::find_if(mesh_groups.begin(), mesh_groups.end(),
-                                            [&vertices, &same_vertex](const auto& candidate) {
-                return candidate.vertices.size() == vertices.size() &&
+                                            [&vertices, &same_vertex, &morph_positions](const auto& candidate) {
+                return morph_positions.empty() && candidate.morph_targets.empty() &&
+                       candidate.vertices.size() == vertices.size() &&
                        std::equal(candidate.vertices.begin(), candidate.vertices.end(),
                                   vertices.begin(), same_vertex);
             });
             std::size_t group_index = 0;
             if (group == mesh_groups.end()) {
                 group_index = mesh_groups.size();
-                mesh_groups.push_back({std::move(vertices), {}});
+                mesh_groups.push_back({std::move(vertices), {}, std::move(morph_positions),
+                                       std::move(morph_normals), std::move(morph_tangents), {}});
+                auto& created_group = mesh_groups.back();
+                for (std::size_t target = 0; target < created_group.morph_positions.size(); ++target)
+                    created_group.morph_targets.push_back({created_group.morph_positions[target],
+                                                           created_group.morph_normals[target],
+                                                           created_group.morph_tangents[target]});
             } else {
                 group_index = static_cast<std::size_t>(group - mesh_groups.begin());
             }
@@ -603,7 +678,7 @@ std::expected<RuntimeModel, std::string> load_runtime_model(astra::renderer::Ren
     model.meshes.reserve(mesh_groups.size());
     for (std::size_t group_index = 0; group_index < mesh_groups.size(); ++group_index) {
         const auto& group = mesh_groups[group_index];
-        auto gpu_mesh = renderer.create_mesh({group.vertices, group.indices});
+        auto gpu_mesh = renderer.create_mesh({group.vertices, group.indices, group.morph_targets});
         if (!gpu_mesh)
             return std::unexpected("Could not upload a shared glTF mesh: " +
                                    gpu_mesh.error().message);
@@ -688,6 +763,14 @@ std::vector<astra::assets::NodePose> blend_node_poses(std::span<const astra::ass
         result[i].scale = {a.scale.x + (b.scale.x - a.scale.x) * amount,
                            a.scale.y + (b.scale.y - a.scale.y) * amount,
                            a.scale.z + (b.scale.z - a.scale.z) * amount};
+        if (a.morph_weights.size() == b.morph_weights.size()) {
+            result[i].morph_weights.resize(a.morph_weights.size());
+            for (std::size_t weight = 0; weight < a.morph_weights.size(); ++weight)
+                result[i].morph_weights[weight] =
+                    a.morph_weights[weight] + (b.morph_weights[weight] - a.morph_weights[weight]) * amount;
+        } else {
+            result[i].morph_weights = b.morph_weights;
+        }
     }
     return result;
 }
@@ -747,7 +830,7 @@ void prepare_static_runtime_model(RuntimeModel& model) {
     std::vector<astra::assets::NodePose> poses(model.source.nodes.size());
     for (std::size_t i = 0; i < model.source.nodes.size(); ++i) {
         const auto& node = model.source.nodes[i];
-        poses[i] = {node.translation, node.rotation, node.scale};
+        poses[i] = {node.translation, node.rotation, node.scale, node.weights};
     }
     model.node_transforms = build_global_node_matrices(model.source, poses);
     const float infinity = std::numeric_limits<float>::infinity();
@@ -935,31 +1018,60 @@ struct MeshBuilder {
 
     void grass_blade(Vec3 base, float height, float width, float angle, float lean,
                      Color base_color, Color tip_color) {
-        const Vec3 side{std::cos(angle) * width, 0.0F, std::sin(angle) * width};
-        const Vec3 bend{std::cos(angle + 1.1F) * lean, 0.0F, std::sin(angle + 1.1F) * lean};
-        const Vec3 left = subtract(base, scale(side, 0.5F));
-        const Vec3 right = add(base, scale(side, 0.5F));
-        const Vec3 tip = add(add(base, {0.0F, height, 0.0F}), bend);
-        const Vec3 normal = normalize(cross(subtract(right, left), subtract(tip, base)));
-        const auto append = [&](Vec3 position, Color color, bool reverse) {
-            MeshVertex vertex{position, reverse ? scale(normal, -1.0F) : normal, color};
-            // Tangent.w=2 identifies foliage; TEXCOORD_1.y carries the blade bend weight.
-            // This is private to generated vegetation, not imported glTF content.
-            vertex.texcoord1_v = position.y == base.y ? 0.0F : 1.0F;
+        // A narrow, curved ribbon reads as a blade from oblique views; three
+        // segments avoid the flat triangular silhouettes of the old tuft mesh.
+        constexpr std::array<float, 4> height_fractions{0.0F, 0.34F, 0.70F, 1.0F};
+        constexpr std::array<float, 4> width_fractions{1.0F, 0.76F, 0.39F, 0.035F};
+        const Vec3 side_axis{std::cos(angle), 0.0F, std::sin(angle)};
+        const Vec3 bend_axis{std::cos(angle + 1.1F), 0.0F, std::sin(angle + 1.1F)};
+        const auto center_at = [&](float t) {
+            return add(add(base, {0.0F, height * t, 0.0F}),
+                       scale(bend_axis, lean * t * t));
+        };
+        const auto color_at = [&](float t) {
+            return Color{base_color.red + (tip_color.red - base_color.red) * t,
+                         base_color.green + (tip_color.green - base_color.green) * t,
+                         base_color.blue + (tip_color.blue - base_color.blue) * t, 1.0F};
+        };
+        const auto append_vertex = [&](Vec3 position, Vec3 normal, Color color, float bend) {
+            MeshVertex vertex{position, normal, color};
+            // The Metal scene, previous-frame and shadow paths share this marker.
+            // UV1.y is the normalized distance from the rooted, stationary base.
+            vertex.texcoord1_v = bend;
             vertex.tangent_x = 1.0F;
-            vertex.tangent_w = 2.0F;
+            vertex.tangent_w = 0.0F;
             vertices.push_back(vertex);
         };
-        const auto first = static_cast<std::uint32_t>(vertices.size());
-        append(left, base_color, false);
-        append(right, base_color, false);
-        append(tip, tip_color, false);
-        indices.insert(indices.end(), {first, first + 1U, first + 2U});
-        const auto back = static_cast<std::uint32_t>(vertices.size());
-        append(left, base_color, true);
-        append(tip, tip_color, true);
-        append(right, base_color, true);
-        indices.insert(indices.end(), {back, back + 1U, back + 2U});
+        for (std::size_t segment = 0; segment + 1U < height_fractions.size(); ++segment) {
+            const float t0 = height_fractions[segment];
+            const float t1 = height_fractions[segment + 1U];
+            const Vec3 center0 = center_at(t0);
+            const Vec3 center1 = center_at(t1);
+            const Vec3 half_width0 = scale(side_axis, width * width_fractions[segment] * 0.5F);
+            const Vec3 half_width1 = scale(side_axis, width * width_fractions[segment + 1U] * 0.5F);
+            const Vec3 left0 = subtract(center0, half_width0);
+            const Vec3 right0 = add(center0, half_width0);
+            const Vec3 left1 = subtract(center1, half_width1);
+            const Vec3 right1 = add(center1, half_width1);
+            const Vec3 normal = normalize(cross(subtract(right0, left0),
+                                                subtract(center1, center0)));
+            const auto first = static_cast<std::uint32_t>(vertices.size());
+            append_vertex(left0, normal, color_at(t0), t0);
+            append_vertex(right0, normal, color_at(t0), t0);
+            append_vertex(right1, normal, color_at(t1), t1);
+            append_vertex(left1, normal, color_at(t1), t1);
+            indices.insert(indices.end(), {first, first + 1U, first + 2U,
+                                           first, first + 2U, first + 3U});
+
+            const auto back = static_cast<std::uint32_t>(vertices.size());
+            const Vec3 back_normal = scale(normal, -1.0F);
+            append_vertex(left0, back_normal, color_at(t0), t0);
+            append_vertex(left1, back_normal, color_at(t1), t1);
+            append_vertex(right1, back_normal, color_at(t1), t1);
+            append_vertex(right0, back_normal, color_at(t0), t0);
+            indices.insert(indices.end(), {back, back + 1U, back + 2U,
+                                           back, back + 2U, back + 3U});
+        }
     }
 
     void grass_tuft(float x, float z, float ground, std::uint32_t& seed) {
@@ -1199,8 +1311,8 @@ MeshBuilder build_chunk_vegetation(const astra::world::TerrainChunk& chunk,
     const auto density = astra::world::vegetation_lod_density(lod);
     std::uint32_t seed = 0xA57A1234U ^ (static_cast<std::uint32_t>(chunk.coord.x) * 0x9E3779B9U) ^
                          (static_cast<std::uint32_t>(chunk.coord.z) * 0x85EBCA6BU);
-    // Crossed, tapered grass blades remain procedural because they are cheap to
-    // stream and deform naturally. Trees, shrubs, ferns and rocks are real assets.
+    // Deterministic curved grass ribbons complement the scanned tree and understory
+    // assets. Their root-to-tip bend weights feed the same GPU wind path as foliage.
     for (unsigned i = 0; i < density.grass_clumps; ++i) {
         if (random_range(seed, 0.0F, 1.0F) < 0.055F)
             continue;
@@ -1450,6 +1562,39 @@ int main() {
     }
     auto terrain_material = std::move(*terrain_material_result);
 
+    // Feed the same outdoor sky/sun used by the scene into the renderer's full
+    // diffuse-irradiance + GGX-prefiltered specular IBL path. This replaces the
+    // much cheaper analytic ambient approximation for the nature scene.
+    const Vec3 light_direction{-0.42F, -0.82F, -0.31F};
+    constexpr std::uint32_t environment_width = 512;
+    constexpr std::uint32_t environment_height = 256;
+    auto environment_pixels =
+        make_outdoor_environment(environment_width, environment_height,
+                                 scale(light_direction, -1.0F));
+    const astra::rhi::EnvironmentData environment_data{
+        .width = environment_width,
+        .height = environment_height,
+        .rgba32f = environment_pixels,
+        .environment_resolution = 128,
+        .irradiance_resolution = 16,
+        .prefilter_resolution = 128,
+        .prefilter_mip_count = 5,
+        .brdf_lut_resolution = 128,
+    };
+    auto environment_result = renderer.create_environment(environment_data);
+    std::unique_ptr<astra::rhi::GpuEnvironment> outdoor_environment;
+    if (environment_result) {
+        outdoor_environment = std::move(*environment_result);
+        logger.log(astra::core::LogLevel::info, "Lighting",
+                   "Outdoor HDR environment, diffuse irradiance and GGX specular prefilter are ready.");
+    } else {
+        logger.log(astra::core::LogLevel::warning, "Lighting",
+                   "Could not create outdoor image-based lighting; using the analytic sky fallback: " +
+                       environment_result.error().message);
+    }
+    environment_pixels.clear();
+    environment_pixels.shrink_to_fit();
+
     astra::core::ThreadPool streaming_workers{2};
     astra::world::WorldStreamerConfig streaming_config;
     streaming_config.chunk_size = 64.0F;
@@ -1570,6 +1715,7 @@ int main() {
     std::vector<Matrix4> previous_global_nodes;
     std::vector<std::vector<Matrix4>> previous_skin_palettes(character.source.nodes.size());
     std::vector<std::vector<Matrix4>> skin_palettes(character.source.nodes.size());
+    std::vector<std::vector<float>> previous_node_morph_weights(character.source.nodes.size());
     std::vector<bool> skin_palette_built(character.source.nodes.size());
     std::vector<DrawItem> draw_items;
     draw_items.reserve(128);
@@ -1930,7 +2076,6 @@ int main() {
             window.request_close();
             return;
         }
-        const Vec3 light_direction{-0.42F, -0.82F, -0.31F};
         const Vec3 light_position = subtract(position, scale(light_direction, 220.0F));
         const Matrix4 light_view_projection = multiply(orthographic(160.0F, 160.0F, 1.0F, 450.0F),
                                                        look_at(light_position, light_direction));
@@ -2090,7 +2235,7 @@ int main() {
         std::vector<astra::assets::NodePose> poses(character.source.nodes.size());
         for (std::size_t i = 0; i < character.source.nodes.size(); ++i) {
             const auto& node = character.source.nodes[i];
-            poses[i] = {node.translation, node.rotation, node.scale};
+            poses[i] = {node.translation, node.rotation, node.scale, node.weights};
         }
         if (!character.source.animations.empty()) {
             const auto evaluate_clip = [&](std::size_t index, float time) {
@@ -2141,6 +2286,7 @@ int main() {
             item.material = primitive.material;
             item.use_material = true;
             item.joint_matrices = skin_palettes[primitive.node];
+            item.morph_weights = poses[primitive.node].morph_weights;
             if (has_previous_character_transform &&
                 previous_global_nodes.size() == character.source.nodes.size() &&
                 previous_skin_palettes.size() == character.source.nodes.size() &&
@@ -2150,6 +2296,9 @@ int main() {
                     multiply(previous_character_transform, previous_global_nodes[primitive.node]);
                 item.has_previous_transform = true;
                 item.previous_joint_matrices = previous_skin_palettes[primitive.node];
+                if (previous_node_morph_weights[primitive.node].size() ==
+                    poses[primitive.node].morph_weights.size())
+                    item.previous_morph_weights = previous_node_morph_weights[primitive.node];
             }
             draw_items.push_back(item);
         }
@@ -2171,6 +2320,7 @@ int main() {
                        .coverage = 0.58F,
                        .wind_velocity = {0.012F, 0.002F, -0.007F},
                        .ray_steps = 6},
+            .environment = outdoor_environment.get(),
         };
         if (auto result = renderer.render_scene(draw_items, view_projection,
                                                 {0.48F, 0.66F, 0.82F, 1.0F}, scene_settings);
@@ -2186,6 +2336,8 @@ int main() {
         previous_character_transform = character_transform;
         previous_global_nodes = global_nodes;
         previous_skin_palettes = skin_palettes;
+        for (std::size_t node = 0; node < poses.size(); ++node)
+            previous_node_morph_weights[node] = poses[node].morph_weights;
         has_previous_character_transform = true;
         if (benchmark_mode) {
             ++benchmark_frames;
