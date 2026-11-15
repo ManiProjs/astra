@@ -1,6 +1,6 @@
 use gpui::{
-    App, Application, Bounds, Context, InteractiveElement, Window, WindowBounds, WindowControlArea,
-    WindowOptions, div, point, prelude::*, px, rgb, size,
+    App, Application, Bounds, Context, FocusHandle, InteractiveElement, Window, WindowBounds,
+    WindowControlArea, WindowOptions, div, point, prelude::*, px, rgb, size,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -41,14 +41,18 @@ struct Studio {
     selected: Option<PathBuf>,
     document: Option<PathBuf>,
     source: String,
+    cursor: usize,
+    dirty: bool,
+    editor_focus: FocusHandle,
     output: Vec<String>,
     status: String,
     bottom_tab: String,
     scene_selection: String,
+    scene_entities: Vec<String>,
 }
 
 impl Studio {
-    fn new() -> Self {
+    fn new(cx: &mut Context<Self>) -> Self {
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let project = fs::read_to_string(root.join("astra.project.json"))
             .ok()
@@ -63,14 +67,18 @@ impl Studio {
             files,
             selected: None,
             document: starter.is_file().then_some(starter),
+            cursor: source.len(),
             source,
+            dirty: false,
+            editor_focus: cx.focus_handle(),
             output: vec![
                 "Astra Studio ready".into(),
                 "Project indexed · Metal renderer · C++23".into(),
             ],
             status: "Ready".into(),
             bottom_tab: "Console".into(),
-            scene_selection: "Directional Light".into(),
+            scene_selection: "World".into(),
+            scene_entities: Vec::new(),
         }
     }
 
@@ -88,6 +96,9 @@ impl Studio {
                 Ok(text) => {
                     self.document = Some(path.clone());
                     self.source = text;
+                    self.cursor = self.source.len();
+                    self.dirty = false;
+                    self.load_scene_entities();
                     self.status = format!("Opened {}", path.display());
                 }
                 Err(error) => self.status = format!("Read failed: {error}"),
@@ -113,51 +124,233 @@ impl Studio {
         self.output.push(self.status.clone());
     }
 
-    fn build(&mut self) {
+    fn save_document(&mut self) {
+        let Some(path) = self.document.clone() else {
+            self.status = "No document is open".into();
+            return;
+        };
+        match fs::write(&path, &self.source) {
+            Ok(()) => {
+                self.dirty = false;
+                self.load_scene_entities();
+                self.status = format!("Saved {}", path.display());
+            }
+            Err(error) => self.status = format!("Save failed: {error}"),
+        }
+        self.output.push(self.status.clone());
+    }
+
+    fn edit_key(&mut self, key: &gpui::KeyDownEvent) {
+        let stroke = &key.keystroke;
+        if stroke.modifiers.secondary() && stroke.key.eq_ignore_ascii_case("s") {
+            self.save_document();
+            return;
+        }
+        if stroke.modifiers.modified() {
+            return;
+        }
+
+        match stroke.key.as_str() {
+            "backspace" if self.cursor > 0 => {
+                let previous = self.source[..self.cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+                self.source.replace_range(previous..self.cursor, "");
+                self.cursor = previous;
+                self.dirty = true;
+            }
+            "delete" if self.cursor < self.source.len() => {
+                let next = self.source[self.cursor..]
+                    .char_indices()
+                    .nth(1)
+                    .map(|(index, _)| self.cursor + index)
+                    .unwrap_or(self.source.len());
+                self.source.replace_range(self.cursor..next, "");
+                self.dirty = true;
+            }
+            "left" if self.cursor > 0 => {
+                self.cursor = self.source[..self.cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+            }
+            "right" if self.cursor < self.source.len() => {
+                self.cursor += self.source[self.cursor..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or(0);
+            }
+            "home" => {
+                self.cursor = self.source[..self.cursor]
+                    .rfind('\n')
+                    .map(|index| index + 1)
+                    .unwrap_or(0);
+            }
+            "end" => {
+                self.cursor = self.source[self.cursor..]
+                    .find('\n')
+                    .map(|index| self.cursor + index)
+                    .unwrap_or(self.source.len());
+            }
+            "enter" => self.insert_text("\n"),
+            "tab" => self.insert_text("    "),
+            _ => {
+                if let Some(text) = stroke.key_char.as_deref() {
+                    if !text.chars().any(char::is_control) {
+                        self.insert_text(text);
+                    }
+                }
+            }
+        }
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        self.source.insert_str(self.cursor, text);
+        self.cursor += text.len();
+        self.dirty = true;
+    }
+
+    fn refresh_files(&mut self) {
+        self.files = scan_project(&self.root);
+        self.status = format!("Project refreshed · {} files indexed", self.files.len());
+        self.output.push(self.status.clone());
+    }
+
+    fn load_scene_entities(&mut self) {
+        self.scene_entities = scene_entity_names(&self.source);
+    }
+
+    fn add_entity(&mut self) {
+        let Some(path) = self.document.as_ref() else {
+            self.status = "Create or open a scene document first".into();
+            return;
+        };
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            self.status = "Entities can only be added to an Astra scene JSON document".into();
+            return;
+        }
+        let (source, name) = match append_scene_entity(&self.source) {
+            Ok(result) => result,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        self.source = source;
+        self.cursor = self.source.len();
+        self.dirty = true;
+        self.scene_entities.push(name.clone());
+        self.scene_selection = name;
+        self.status = "Entity added · ⌘S to save scene".into();
+        self.output.push(self.status.clone());
+    }
+
+    fn create_scene(&mut self) {
+        let directory = self.root.join("Scenes");
+        let mut index = 1;
+        let path = loop {
+            let filename = if index == 1 {
+                "NewScene.json".to_owned()
+            } else {
+                format!("NewScene{index}.json")
+            };
+            let candidate = directory.join(filename);
+            if !candidate.exists() {
+                break candidate;
+            }
+            index += 1;
+        };
+        let scene = serde_json::json!({
+            "format": "astra-scene",
+            "version": 1,
+            "name": path.file_stem().unwrap_or_default().to_string_lossy(),
+            "entities": []
+        });
+        let result = fs::create_dir_all(&directory).and_then(|()| {
+            fs::write(
+                &path,
+                format!("{}\n", serde_json::to_string_pretty(&scene).unwrap()),
+            )
+        });
+        match result {
+            Ok(()) => {
+                self.refresh_files();
+                self.selected = Some(path.clone());
+                self.document = Some(path.clone());
+                self.source = fs::read_to_string(&path).unwrap_or_default();
+                self.cursor = self.source.len();
+                self.dirty = false;
+                self.load_scene_entities();
+                self.scene_selection = "World".into();
+                self.status = format!("Created {}", path.display());
+            }
+            Err(error) => self.status = format!("Scene creation failed: {error}"),
+        }
+        self.output.push(self.status.clone());
+    }
+
+    fn build(&mut self, cx: &mut Context<Self>) {
+        let root = self.root.clone();
         self.output
             .push("$ cmake --build build --target astra_open_world -j 4".into());
         self.status = "Building astra_open_world…".into();
-        match Command::new("cmake")
-            .args([
-                "--build",
-                "build",
-                "--target",
-                "astra_open_world",
-                "-j",
-                "4",
-            ])
-            .current_dir(&self.root)
-            .output()
-        {
-            Ok(result) => {
-                let stdout = String::from_utf8_lossy(&result.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&result.stderr).to_string();
-                let lines = stdout
-                    .lines()
-                    .chain(stderr.lines())
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                self.output.extend(
-                    lines
-                        .into_iter()
-                        .rev()
-                        .take(70)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev(),
-                );
-                self.status = if result.status.success() {
-                    "Build succeeded · astra_open_world".into()
-                } else {
-                    format!("Build failed · exit {}", result.status.code().unwrap_or(-1))
-                };
-            }
-            Err(error) => self.status = format!("CMake could not start: {error}"),
-        }
-        self.output.push(self.status.clone());
-        if self.output.len() > 100 {
-            self.output.drain(..self.output.len() - 100);
-        }
+        let executor = cx.background_executor().clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = executor
+                .spawn(async move {
+                    Command::new("cmake")
+                        .args([
+                            "--build",
+                            "build",
+                            "--target",
+                            "astra_open_world",
+                            "-j",
+                            "4",
+                        ])
+                        .current_dir(root)
+                        .output()
+                })
+                .await;
+            let _ = this.update(cx, |this: &mut Studio, cx: &mut Context<Studio>| {
+                match result {
+                    Ok(result) => {
+                        let stdout = String::from_utf8_lossy(&result.stdout).to_string();
+                        let stderr = String::from_utf8_lossy(&result.stderr).to_string();
+                        let lines = stdout
+                            .lines()
+                            .chain(stderr.lines())
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>();
+                        this.output.extend(
+                            lines
+                                .into_iter()
+                                .rev()
+                                .take(70)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev(),
+                        );
+                        this.status = if result.status.success() {
+                            "Build succeeded · astra_open_world".into()
+                        } else {
+                            format!("Build failed · exit {}", result.status.code().unwrap_or(-1))
+                        };
+                    }
+                    Err(error) => this.status = format!("CMake could not start: {error}"),
+                }
+                this.output.push(this.status.clone());
+                if this.output.len() > 100 {
+                    this.output.drain(..this.output.len() - 100);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn run(&mut self) {
@@ -223,6 +416,46 @@ fn scan_project(root: &Path) -> Vec<PathBuf> {
     files.sort();
     files.truncate(2500);
     files
+}
+
+fn scene_entity_names(source: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(source) else {
+        return Vec::new();
+    };
+    if value.get("format").and_then(|v| v.as_str()) != Some("astra-scene") {
+        return Vec::new();
+    }
+    value
+        .get("entities")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|entity| entity.get("name").and_then(|name| name.as_str()))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn append_scene_entity(source: &str) -> Result<(String, String), String> {
+    let mut scene = serde_json::from_str::<serde_json::Value>(source)
+        .map_err(|_| "The open JSON document is not a valid scene".to_owned())?;
+    if scene.get("format").and_then(|v| v.as_str()) != Some("astra-scene") {
+        return Err("The open JSON document is not an Astra scene".into());
+    }
+    let entities = scene["entities"]
+        .as_array_mut()
+        .ok_or_else(|| "Scene entities must be a JSON array".to_owned())?;
+    let name = format!("Entity {}", entities.len() + 1);
+    entities.push(serde_json::json!({
+        "name": name,
+        "transform": {
+            "position": [0.0, 0.0, 0.0],
+            "rotation": [0.0, 0.0, 0.0],
+            "scale": [1.0, 1.0, 1.0]
+        }
+    }));
+    let serialized = serde_json::to_string_pretty(&scene)
+        .map_err(|error| format!("Scene serialization failed: {error}"))?;
+    Ok((serialized + "\n", name))
 }
 
 fn label(text: impl Into<String>, color: u32, size: f32) -> gpui::Div {
@@ -363,6 +596,27 @@ impl Render for Studio {
                     )
                     .child(
                         div()
+                            .id("save-document")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.save_document();
+                                cx.notify();
+                            }))
+                            .child(action(
+                                if self.dirty { "Save •" } else { "Save" },
+                                self.dirty,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("refresh-project")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.refresh_files();
+                                cx.notify();
+                            }))
+                            .child(action("Refresh", false)),
+                    )
+                    .child(
+                        div()
                             .flex()
                             .items_center()
                             .gap_1()
@@ -375,8 +629,7 @@ impl Render for Studio {
                         div()
                             .id("build")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.build();
-                                cx.notify();
+                                this.build(cx);
                             }))
                             .child(action("Build", false)),
                     )
@@ -426,23 +679,60 @@ impl Render for Studio {
             .bg(rgb(PANEL))
             .border_r_1()
             .border_color(rgb(BORDER))
-            .child(panel_heading("Hierarchy", "＋  ···"))
+            .child(
+                div()
+                    .h(px(32.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .bg(rgb(PANEL))
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(eyebrow("Hierarchy"))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id("new-scene")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.create_scene();
+                                        cx.notify();
+                                    }))
+                                    .child(action("＋ Scene", false)),
+                            )
+                            .child(
+                                div()
+                                    .id("new-entity")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.add_entity();
+                                        cx.notify();
+                                    }))
+                                    .child(action("＋ Entity", false)),
+                            ),
+                    ),
+            )
             .child(
                 div()
                     .px_3()
                     .py_2()
                     .child(label("▾  OPEN WORLD", 0xc4c4c4, 10.)),
             )
-            .child(div().flex().flex_col().children([
-                scene_row("World", 1., "▾", 0),
-                scene_row("Environment", 2., "▾", 1),
-                scene_row("Directional Light", 3., "☼", 2),
-                scene_row("Sky & Atmosphere", 3., "◌", 3),
-                scene_row("Terrain", 2., "▰", 4),
-                scene_row("Player", 2., "◇", 5),
-                scene_row("Camera", 3., "⌖", 6),
-                scene_row("Boar", 2., "◇", 7),
-            ]))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .children([scene_row("World", 1., "▾", 0)]),
+            )
+            .children(
+                self.scene_entities
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| scene_row(name, 2., "◇", index + 1)),
+            )
             .child(div().h(px(1.)).mx_3().my_2().bg(rgb(BORDER)))
             .child(
                 div()
@@ -541,6 +831,7 @@ impl Render for Studio {
                     .to_string()
             })
             .unwrap_or_else(|| "No selection".into());
+        let entity_count = self.scene_entities.len().to_string();
         let inspector = div()
             .w(px(252.))
             .min_w(px(205.))
@@ -577,7 +868,7 @@ impl Render for Studio {
                             .flex_col()
                             .gap(px(2.))
                             .child(label(self.scene_selection.clone(), TEXT, 11.))
-                            .child(label("DIRECTIONAL LIGHT", DIM, 8.)),
+                            .child(label("SCENE SELECTION", DIM, 8.)),
                     )
                     .child(label("◉", MUTED, 11.)),
             )
@@ -592,34 +883,11 @@ impl Render for Studio {
                     .child(label("⌄", MUTED, 11.)),
             )
             .child(property_group(
-                "Position",
-                [("X", "0.00"), ("Y", "12.50"), ("Z", "0.00")],
-            ))
-            .child(property_group(
-                "Rotation",
-                [("X", "-45.00°"), ("Y", "35.00°"), ("Z", "0.00°")],
-            ))
-            .child(property_group(
-                "Scale",
-                [("X", "1.00"), ("Y", "1.00"), ("Z", "1.00")],
-            ))
-            .child(div().h(px(1.)).mx_3().my_2().bg(rgb(BORDER)))
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(eyebrow("Light component"))
-                    .child(label("⌄", MUTED, 11.)),
-            )
-            .child(property_group(
-                "Illumination",
+                "Scene",
                 [
-                    ("Intensity", "3.50 lx"),
-                    ("Color", "  255  255  255"),
-                    ("Shadows", "Enabled"),
+                    ("Entities", entity_count),
+                    ("Format", "Astra JSON".into()),
+                    ("Version", "1".into()),
                 ],
             ))
             .child(div().h(px(1.)).mx_3().my_2().bg(rgb(BORDER)))
@@ -637,7 +905,16 @@ impl Render for Studio {
                 div()
                     .px_3()
                     .pb_3()
-                    .child(label(selected_title, 0xbdbdbd, 10.)),
+                    .child(label(selected_title, 0xbdbdbd, 10.))
+                    .child(label(
+                        selected_path
+                            .as_ref()
+                            .and_then(|path| fs::metadata(path).ok())
+                            .map(|metadata| format!("{} bytes", metadata.len()))
+                            .unwrap_or_else(|| "No file selected".into()),
+                        DIM,
+                        9.,
+                    )),
             )
             .child(div().flex_1())
             .child(
@@ -795,9 +1072,15 @@ impl Render for Studio {
             .child(div().flex_1())
             .child(div().px_3().child(label("SOURCE", DIM, 8.)));
 
+        let cursor_line = self.source[..self.cursor].matches('\n').count();
+        let line_start = self.source[..self.cursor]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let cursor_column = self.source[line_start..self.cursor].chars().count();
         let code_lines = self
             .source
-            .lines()
+            .split('\n')
             .take(180)
             .enumerate()
             .map(|(i, line)| {
@@ -811,6 +1094,13 @@ impl Render for Studio {
                     0xd0d0d0
                 } else {
                     0xb8b8b8
+                };
+                let display_line = if i == cursor_line {
+                    let mut chars = line.chars();
+                    let before = chars.by_ref().take(cursor_column).collect::<String>();
+                    format!("{before}▏{}", chars.collect::<String>())
+                } else {
+                    line.to_owned()
                 };
                 div()
                     .flex()
@@ -831,20 +1121,34 @@ impl Render for Studio {
                             .text_size(px(10.))
                             .font_family("SF Mono")
                             .text_color(rgb(color))
-                            .child(if line.is_empty() {
+                            .child(if display_line.is_empty() {
                                 " ".into()
                             } else {
-                                line.to_string()
+                                display_line
                             }),
                     )
             })
             .collect::<Vec<_>>();
+        let line_number = self.source[..self.cursor]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
         let source_editor = div()
             .flex()
             .flex_col()
             .bg(rgb(BG))
             .border_t_1()
             .border_color(rgb(BORDER))
+            .id("source-editor")
+            .track_focus(&self.editor_focus)
+            .on_click(cx.listener(|this, _, window, _| {
+                window.focus(&this.editor_focus);
+            }))
+            .on_key_down(cx.listener(|this, event, _, cx| {
+                this.edit_key(event);
+                cx.notify();
+            }))
             .child(
                 div()
                     .h(px(27.))
@@ -853,8 +1157,16 @@ impl Render for Studio {
                     .items_center()
                     .justify_between()
                     .bg(rgb(SURFACE))
-                    .child(label(format!("{}  /  {}", document_name, "C++"), MUTED, 9.))
-                    .child(label("READ ONLY", DIM, 8.)),
+                    .child(label(format!("{}  /  SOURCE", document_name), MUTED, 9.))
+                    .child(label(
+                        if self.dirty {
+                            "MODIFIED · ⌘S TO SAVE"
+                        } else {
+                            "EDITABLE"
+                        },
+                        if self.dirty { 0xd0b078 } else { DIM },
+                        8.,
+                    )),
             )
             .child(
                 div()
@@ -960,7 +1272,7 @@ impl Render for Studio {
                     .gap_3()
                     .child(label("METAL", MUTED, 8.))
                     .child(label("C++23", MUTED, 8.))
-                    .child(label("Ln 1, Col 1", MUTED, 8.))
+                    .child(label(format!("Ln {line_number}"), MUTED, 8.))
                     .child(label("UTF-8", MUTED, 8.)),
             );
 
@@ -1018,7 +1330,7 @@ impl Render for Studio {
     }
 }
 
-fn property_group(name: &str, values: [(&str, &str); 3]) -> gpui::Div {
+fn property_group(name: &str, values: [(&str, String); 3]) -> gpui::Div {
     div()
         .px_3()
         .pb_2()
@@ -1061,9 +1373,39 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| Studio::new()),
+            |_, cx| cx.new(|cx| Studio::new(cx)),
         )
         .expect("open Astra Studio");
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append_scene_entity, scene_entity_names};
+
+    #[test]
+    fn reads_entity_names_from_astra_scene_documents() {
+        let scene = r#"{"format":"astra-scene","entities":[{"name":"Camera"},{"name":"Terrain"}]}"#;
+        assert_eq!(scene_entity_names(scene), ["Camera", "Terrain"]);
+    }
+
+    #[test]
+    fn appends_entity_with_default_transform() {
+        let scene = r#"{"format":"astra-scene","version":1,"entities":[{"name":"Camera"}]}"#;
+        let (updated, name) = append_scene_entity(scene).expect("valid scene");
+        assert_eq!(name, "Entity 2");
+        let value: serde_json::Value = serde_json::from_str(&updated).expect("valid JSON");
+        assert_eq!(value["entities"][1]["name"], "Entity 2");
+        assert_eq!(
+            value["entities"][1]["transform"]["scale"],
+            serde_json::json!([1.0, 1.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn rejects_non_astra_json_documents() {
+        assert!(append_scene_entity(r#"{"name":"settings"}"#).is_err());
+        assert!(append_scene_entity("not JSON").is_err());
+    }
 }

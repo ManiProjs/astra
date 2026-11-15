@@ -242,9 +242,10 @@ existing module boundaries rather than expanding the open-world example into a m
 ## Astra Studio
 
 Astra Studio is the Rust 2024 + GPUI desktop application in `rust/astra-studio/`. It currently
-provides a native desktop project workspace, project-file explorer, read-only source view,
-file selection inspector, CMake build action with captured output, Blender `.blend` handoff,
-and a launcher for the existing open-world runtime example. The source view is not yet an
-editable code editor with language services. The runtime still presents in its own native
-window; the editor does not yet embed the engine's Metal surface or expose a persistent scene
-graph. See `editor/README.md` for the staged integration plan.
+provides a native desktop project workspace, project-file explorer, basic keyboard-editable
+source view with save, file selection inspector, asynchronous CMake build action with captured
+output, Blender `.blend` handoff, and a launcher for the existing open-world runtime example.
+It can create Astra scene JSON documents and add entities with default transforms; the hierarchy
+is loaded from the active scene document. The source editor is not yet a full text editor with
+selection, undo, or language services. The runtime still presents in its own native window; the
+editor does not yet embed the engine's Metal surface. See `editor/README.md` for the staged plan.
