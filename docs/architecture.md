@@ -42,9 +42,9 @@ depend on the editor or on a concrete graphics backend.
 | backends/metal/ | Native Metal device, pipeline, command queue, and presentation implementation. |
 | `backends/vulkan/` | Future Vulkan implementation for supported desktop platforms. |
 | `backends/directx12/` | Future Direct3D 12 implementation for Windows. |
-| `editor/` | Future editor application and its user interface. |
+| `editor/` | Astra Studio architecture, workflows, and editor integration documentation. |
 | `tools/` | Developer-facing command-line tools and diagnostics. |
-| `rust/` | Cargo workspace for asset tooling, package management, and suitable support tools. |
+| `rust/` | Cargo workspace for Astra Studio, asset tooling, package management, and support tools. |
 | `tests/` | Unit, integration, and system-level tests. |
 | `examples/` | Small projects demonstrating supported engine workflows. |
 | `third_party/` | Reviewed third-party source dependencies, only when justified. |
@@ -238,3 +238,13 @@ slice; its render graph executes pass callbacks but does not yet allocate/alias 
 explicit backend barriers. It does not yet provide a production render graph, animation retargeting, asset hot
 reload, or a production editor. New systems should remain behind the
 existing module boundaries rather than expanding the open-world example into a monolith.
+
+## Astra Studio
+
+Astra Studio is the Rust 2024 + GPUI desktop application in `rust/astra-studio/`. It currently
+provides a native desktop project workspace, project-file explorer, read-only source view,
+file selection inspector, CMake build action with captured output, Blender `.blend` handoff,
+and a launcher for the existing open-world runtime example. The source view is not yet an
+editable code editor with language services. The runtime still presents in its own native
+window; the editor does not yet embed the engine's Metal surface or expose a persistent scene
+graph. See `editor/README.md` for the staged integration plan.

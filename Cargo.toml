@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = []
+members = ["rust/astra-studio"]
 
 [workspace.package]
 edition = "2024"
