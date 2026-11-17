@@ -1,6 +1,7 @@
 #pragma once
 
 #include <astra/rhi/types.hpp>
+#include <astra/core/memory_budget.hpp>
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -364,6 +365,9 @@ struct MaterialData final {
     Color emissive{};
     float metallic{};
     float roughness{0.72F};
+    // Layered dielectric clearcoat lobe (KHR_materials_clearcoat semantics).
+    float clearcoat{};
+    float clearcoat_roughness{0.1F};
     float normal_scale{1.0F};
     float occlusion_strength{1.0F};
     const GpuTexture* base_color_texture{};
@@ -390,6 +394,10 @@ struct MaterialData final {
     MaterialSamplerDesc normal_sampler{};
     MaterialSamplerDesc occlusion_sampler{};
     MaterialSamplerDesc emissive_sampler{};
+    // Optional Metal procedural water displacement; zero amplitude disables it.
+    float water_wave_amplitude{};
+    float water_wave_frequency{0.12F};
+    float water_wave_speed{0.65F};
 };
 
 // Reusable world-space volumetric cloud controls. The Metal renderer evaluates
@@ -468,6 +476,36 @@ struct GtaoSettings final {
     float bias{0.035F};
 };
 
+// Display-referred look controls applied after temporal resolve and exposure.
+// Values are intentionally small and backend-neutral; unsupported backends may
+// retain their default neutral transform until their post stack is implemented.
+struct CinematicPostSettings final {
+    float contrast{1.0F};
+    float saturation{1.0F};
+    float temperature{}; // warm/cool white-balance bias in [-1, 1]
+    float tint{};        // green/magenta bias in [-1, 1]
+    float vignette{};    // edge darkening in [0, 1]
+};
+
+struct BloomSettings final {
+    bool enabled{};
+    float threshold{1.0F};
+    float intensity{0.15F};
+};
+
+struct DepthOfFieldSettings final {
+    bool enabled{};
+    float focus_distance{24.0F};
+    float focus_range{12.0F};
+    float maximum_blur_pixels{2.0F};
+};
+
+struct AtmosphereSettings final {
+    float fog_density{0.008F};
+    float fog_extinction{1.0F};
+    float fog_albedo{0.85F};
+};
+
 struct SceneSettings final {
     Vec3 camera_position{};
     Vec3 light_direction{-0.42F, -0.82F, -0.31F};
@@ -495,6 +533,10 @@ struct SceneSettings final {
     std::span<const PointLight> point_lights{};
     // Appended to preserve existing positional SceneSettings aggregate prefixes.
     GtaoSettings gtao{};
+    CinematicPostSettings cinematic_post{};
+    BloomSettings bloom{};
+    DepthOfFieldSettings depth_of_field{};
+    AtmosphereSettings atmosphere{};
 };
 
 [[nodiscard]] inline std::expected<void, std::string>
@@ -526,6 +568,32 @@ validate_scene_lighting(const SceneSettings& settings) {
         !std::isfinite(settings.gtao.bias) || settings.gtao.bias < 0.0F ||
         settings.gtao.bias > 0.5F)
         return std::unexpected("GTAO radius, strength or bias is outside its supported finite range.");
+    const auto& post = settings.cinematic_post;
+    if (!std::isfinite(post.contrast) || post.contrast < 0.0F || post.contrast > 3.0F ||
+        !std::isfinite(post.saturation) || post.saturation < 0.0F || post.saturation > 3.0F ||
+        !std::isfinite(post.temperature) || post.temperature < -1.0F || post.temperature > 1.0F ||
+        !std::isfinite(post.tint) || post.tint < -1.0F || post.tint > 1.0F ||
+        !std::isfinite(post.vignette) || post.vignette < 0.0F || post.vignette > 1.0F)
+        return std::unexpected("Cinematic post settings are outside their supported finite ranges.");
+    const auto& bloom = settings.bloom;
+    if (!std::isfinite(bloom.threshold) || bloom.threshold < 0.0F || bloom.threshold > 32.0F ||
+        !std::isfinite(bloom.intensity) || bloom.intensity < 0.0F || bloom.intensity > 4.0F)
+        return std::unexpected("Bloom threshold or intensity is outside its supported finite range.");
+    const auto& dof = settings.depth_of_field;
+    if (!std::isfinite(dof.focus_distance) || dof.focus_distance <= 0.0F ||
+        !std::isfinite(dof.focus_range) || dof.focus_range <= 0.0F ||
+        !std::isfinite(dof.maximum_blur_pixels) || dof.maximum_blur_pixels < 0.0F ||
+        dof.maximum_blur_pixels > 12.0F)
+        return std::unexpected("Depth-of-field focus or blur parameters are outside their supported finite ranges.");
+    if (!std::isfinite(settings.atmosphere.fog_density) || settings.atmosphere.fog_density < 0.0F ||
+        settings.atmosphere.fog_density > 0.1F)
+        return std::unexpected("Atmospheric fog density must be finite and within [0, 0.1].");
+    if (!std::isfinite(settings.atmosphere.fog_extinction) || settings.atmosphere.fog_extinction < 0.0F ||
+        settings.atmosphere.fog_extinction > 10.0F)
+        return std::unexpected("Atmospheric fog extinction must be finite and within [0, 10].");
+    if (!std::isfinite(settings.atmosphere.fog_albedo) || settings.atmosphere.fog_albedo < 0.0F ||
+        settings.atmosphere.fog_albedo > 1.0F)
+        return std::unexpected("Atmospheric fog scattering albedo must be finite and within [0, 1].");
     return {};
 }
 
@@ -555,6 +623,7 @@ class RenderDevice {
     [[nodiscard]] virtual const std::string& device_name() const noexcept = 0;
     // Most recent completed GPU command-buffer duration, when the backend exposes it.
     [[nodiscard]] virtual double last_gpu_frame_time_ms() const noexcept { return 0.0; }
+    [[nodiscard]] virtual core::MemoryBudgetStats memory_stats() const noexcept { return {}; }
 
     [[nodiscard]] virtual std::expected<std::unique_ptr<GpuMesh>, RenderError>
     create_mesh(const MeshData& data) = 0;

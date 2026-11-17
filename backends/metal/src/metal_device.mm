@@ -3,6 +3,7 @@
 
 #include <astra/metal/metal_device.hpp>
 #include <astra/renderer/temporal.hpp>
+#include <astra/core/memory_budget.hpp>
 #include <astra/rhi/render_graph.hpp>
 
 #include <algorithm>
@@ -25,7 +26,6 @@ constexpr std::size_t shadow_cascade_count = 3;
 // Spend shadow texels where they are visible. The near cascade keeps full
 // resolution; the wider mid/far cascades use progressively fewer texels.
 constexpr std::array<NSUInteger, shadow_cascade_count> shadow_map_sizes{1024, 768, 384};
-constexpr float default_fog_density = 0.008F;
 
 using Vec3 = rhi::Vec3;
 using Vec4 = rhi::Vec4;
@@ -434,11 +434,12 @@ public:
   MetalMesh(id<MTLBuffer> vertices, id<MTLBuffer> indices, NSUInteger index_count,
             BoundsSphere bounds, bool skinned, id<MTLBuffer> morph_deltas,
             NSUInteger morph_target_count, NSUInteger vertex_count,
-            std::vector<float> morph_delta_radii)
+            std::vector<float> morph_delta_radii, core::MemoryBudget::Reservation reservation)
       : vertices_(vertices), indices_(indices), index_count_(index_count), bounds_(bounds),
         skinned_(skinned), morph_deltas_(morph_deltas),
         morph_target_count_(morph_target_count), vertex_count_(vertex_count),
-        morph_delta_radii_(std::move(morph_delta_radii)) {}
+        morph_delta_radii_(std::move(morph_delta_radii)),
+        memory_reservation_(std::move(reservation)) {}
   id<MTLBuffer> vertices() const noexcept { return vertices_; }
   id<MTLBuffer> indices() const noexcept { return indices_; }
   NSUInteger index_count() const noexcept { return index_count_; }
@@ -483,6 +484,7 @@ private:
   NSUInteger morph_target_count_{};
   NSUInteger vertex_count_{};
   std::vector<float> morph_delta_radii_;
+  core::MemoryBudget::Reservation memory_reservation_;
 };
 
 class MetalVirtualGeometry final : public rhi::GpuVirtualGeometry {
@@ -490,11 +492,12 @@ public:
   MetalVirtualGeometry(id<MTLBuffer> vertices, id<MTLBuffer> indices, id<MTLBuffer> clusters,
                        id<MTLBuffer> indirect_arguments, id<MTLIndirectCommandBuffer> icb,
                        id<MTLBuffer> icb_arguments, NSUInteger index_count,
-                       NSUInteger cluster_count, BoundsSphere bounds)
+                       NSUInteger cluster_count, BoundsSphere bounds,
+                       core::MemoryBudget::Reservation reservation)
       : vertices_(vertices), indices_(indices), clusters_(clusters),
         indirect_arguments_(indirect_arguments), icb_(icb), icb_arguments_(icb_arguments),
-        index_count_(index_count),
-        cluster_count_(cluster_count), bounds_(bounds) {}
+        index_count_(index_count), cluster_count_(cluster_count), bounds_(bounds),
+        memory_reservation_(std::move(reservation)) {}
   id<MTLBuffer> vertices() const noexcept { return vertices_; }
   id<MTLBuffer> indices() const noexcept { return indices_; }
   id<MTLBuffer> clusters() const noexcept { return clusters_; }
@@ -515,6 +518,7 @@ private:
   NSUInteger index_count_{};
   NSUInteger cluster_count_{};
   BoundsSphere bounds_{};
+  core::MemoryBudget::Reservation memory_reservation_;
 };
 
 CascadedShadowData build_shadow_cascades(const rhi::SceneSettings& settings,
@@ -690,20 +694,23 @@ CascadedShadowData build_shadow_cascades(const rhi::SceneSettings& settings,
 
 class MetalTexture final : public rhi::GpuTexture {
 public:
-  explicit MetalTexture(id<MTLTexture> texture) : texture_(texture) {}
+  MetalTexture(id<MTLTexture> texture, core::MemoryBudget::Reservation reservation)
+      : texture_(texture), memory_reservation_(std::move(reservation)) {}
   id<MTLTexture> texture() const noexcept { return texture_; }
 
 private:
   __strong id<MTLTexture> texture_;
+  core::MemoryBudget::Reservation memory_reservation_;
 };
 
 class MetalEnvironment final : public rhi::GpuEnvironment {
 public:
   MetalEnvironment(id<MTLTexture> environment, id<MTLTexture> irradiance,
                    id<MTLTexture> prefiltered,
-                   id<MTLTexture> brdf_lut, std::uint32_t prefilter_mip_count)
+                   id<MTLTexture> brdf_lut, std::uint32_t prefilter_mip_count,
+                   core::MemoryBudget::Reservation reservation)
       : environment_(environment), irradiance_(irradiance), prefiltered_(prefiltered), brdf_lut_(brdf_lut),
-        prefilter_mip_count_(prefilter_mip_count) {}
+        prefilter_mip_count_(prefilter_mip_count), memory_reservation_(std::move(reservation)) {}
   id<MTLTexture> environment() const noexcept { return environment_; }
   id<MTLTexture> irradiance() const noexcept { return irradiance_; }
   id<MTLTexture> prefiltered() const noexcept { return prefiltered_; }
@@ -716,6 +723,7 @@ private:
   __strong id<MTLTexture> prefiltered_;
   __strong id<MTLTexture> brdf_lut_;
   std::uint32_t prefilter_mip_count_{};
+  core::MemoryBudget::Reservation memory_reservation_;
 };
 
 struct SceneUniforms final {
@@ -744,6 +752,9 @@ struct SceneUniforms final {
   float uv_rotation[5][4];  // cos(rotation), sin(rotation), reserved, reserved
   float environment_flags[4]; // enabled, maximum prefilter mip, reserved, reserved
   std::uint32_t morph_flags[4]; // target count, per-instance weights, vertex count, point-light count
+  float clearcoat_parameters[4]; // factor, perceptual roughness, reserved, reserved
+  float water_parameters[4]; // amplitude, spatial frequency, speed, reserved
+  float fog_params[4]; // extinction coefficient, scattering albedo, reserved, reserved
 };
 
 struct alignas(16) IblDispatchUniforms final {
@@ -784,7 +795,7 @@ static_assert(offsetof(rhi::MeshVertex, texcoord1_u) == 48);
 static_assert(offsetof(rhi::MeshVertex, tangent_x) == 56);
 static_assert(offsetof(rhi::MeshVertex, joints) == 72);
 static_assert(offsetof(rhi::MeshVertex, weights) == 80);
-static_assert(sizeof(SceneUniforms) == 896);
+static_assert(sizeof(SceneUniforms) == 944);
 static_assert(offsetof(SceneUniforms, texcoord_sets0) == 480);
 static_assert(offsetof(SceneUniforms, texcoord_sets1) == 496);
 static_assert(offsetof(SceneUniforms, alpha_flags) == 512);
@@ -797,6 +808,9 @@ static_assert(offsetof(SceneUniforms, uv_transform) == 704);
 static_assert(offsetof(SceneUniforms, uv_rotation) == 784);
 static_assert(offsetof(SceneUniforms, environment_flags) == 864);
 static_assert(offsetof(SceneUniforms, morph_flags) == 880);
+static_assert(offsetof(SceneUniforms, clearcoat_parameters) == 896);
+static_assert(offsetof(SceneUniforms, water_parameters) == 912);
+static_assert(offsetof(SceneUniforms, fog_params) == 928);
 static_assert(sizeof(IblDispatchUniforms) == 32);
 static_assert(sizeof(SkyUniforms) == 256);
 static_assert(offsetof(TaaUniforms, camera_position) == 64);
@@ -1262,7 +1276,9 @@ public:
         ibl_equirect_pipeline, ibl_irradiance_pipeline, ibl_prefilter_pipeline, ibl_brdf_pipeline,
         depth_state, transparent_depth_state, shadow_depth_state, sampler, taa_sampler,
         shadow_sampler, ibl_sampler, ibl_equirect_sampler,
-        shadow_textures, device.name}};
+        shadow_textures, device.name,
+        core::MemoryBudget{{0U, 0U, static_cast<std::size_t>(device.recommendedMaxWorkingSetSize > 0
+            ? device.recommendedMaxWorkingSetSize * 55U / 100U : 1024ULL * 1024ULL * 1024ULL)}}}};
     return std::unique_ptr<rhi::RenderDevice>{std::move(result)};
   }
 
@@ -1271,6 +1287,9 @@ public:
   double last_gpu_frame_time_ms() const noexcept override {
     return static_cast<double>(gpu_time_nanoseconds_->load(std::memory_order_acquire)) * 1.0e-6;
   }
+  core::MemoryBudgetStats memory_stats() const noexcept override {
+    return memory_budget_.stats(core::MemoryPool::unified);
+  }
 
   std::expected<std::unique_ptr<rhi::GpuVirtualGeometry>, rhi::RenderError>
   create_virtual_geometry(const rhi::VirtualGeometryData& data) override {
@@ -1278,7 +1297,32 @@ public:
     if (!valid)
       return std::unexpected(
           rhi::RenderError{.code = rhi::RenderErrorCode::invalid_mesh, .message = valid.error()});
+    if (data.vertices.size() > std::numeric_limits<std::size_t>::max() /
+                                   sizeof(PackedStaticMeshVertex) ||
+        data.clusters.size() > std::numeric_limits<std::size_t>::max() /
+                                   sizeof(VirtualGeometryIndirectArguments) ||
+        (virtual_geometry_icb_supported_ &&
+         data.clusters.size() > std::numeric_limits<std::size_t>::max() / 32U))
+      return std::unexpected(rhi::RenderError{.code = rhi::RenderErrorCode::invalid_mesh,
+          .message = "Virtual geometry buffer sizes overflow addressable memory."});
     const std::size_t vertex_bytes = data.vertices.size() * sizeof(PackedStaticMeshVertex);
+    const std::size_t indirect_bytes =
+        data.clusters.size() * sizeof(VirtualGeometryIndirectArguments);
+    const std::size_t index_bytes = data.indices.size_bytes();
+    const std::size_t cluster_bytes = data.clusters.size_bytes();
+    const std::size_t icb_bytes = virtual_geometry_icb_supported_ ? data.clusters.size() * 32U : 0U;
+    if (vertex_bytes > std::numeric_limits<std::size_t>::max() - index_bytes ||
+        vertex_bytes + index_bytes > std::numeric_limits<std::size_t>::max() - cluster_bytes ||
+        vertex_bytes + index_bytes + cluster_bytes > std::numeric_limits<std::size_t>::max() - indirect_bytes ||
+        vertex_bytes + index_bytes + cluster_bytes + indirect_bytes > std::numeric_limits<std::size_t>::max() - icb_bytes)
+      return std::unexpected(rhi::RenderError{.code = rhi::RenderErrorCode::invalid_mesh,
+          .message = "Virtual geometry resource sizes overflow addressable memory."});
+    const std::size_t total_bytes = vertex_bytes + index_bytes + cluster_bytes + indirect_bytes + icb_bytes;
+    auto reservation = memory_budget_.reserve(core::MemoryPool::unified,
+                                               core::MemoryClass::geometry, total_bytes);
+    if (!reservation)
+      return std::unexpected(rhi::RenderError{.code = rhi::RenderErrorCode::resource_creation_failed,
+          .message = "Virtual geometry exceeds the configured unified-memory budget: " + reservation.error().message});
     id<MTLBuffer> vertices = [device_ newBufferWithLength:vertex_bytes
                                                    options:MTLResourceStorageModeShared];
     if (vertices != nil)
@@ -1290,9 +1334,7 @@ public:
     id<MTLBuffer> clusters = [device_ newBufferWithBytes:data.clusters.data()
                                                   length:data.clusters.size_bytes()
                                                  options:MTLResourceStorageModeShared];
-    const NSUInteger indirect_bytes =
-        static_cast<NSUInteger>(data.clusters.size()) * sizeof(VirtualGeometryIndirectArguments);
-    id<MTLBuffer> indirect_arguments = [device_ newBufferWithLength:indirect_bytes
+    id<MTLBuffer> indirect_arguments = [device_ newBufferWithLength:static_cast<NSUInteger>(indirect_bytes)
                                                             options:MTLResourceStorageModeShared];
     if (vertices == nil || indices == nil || clusters == nil || indirect_arguments == nil) {
       return std::unexpected(
@@ -1332,7 +1374,7 @@ public:
     return std::unique_ptr<rhi::GpuVirtualGeometry>{new MetalVirtualGeometry{
         vertices, indices, clusters, indirect_arguments, icb, icb_arguments,
         static_cast<NSUInteger>(data.indices.size()), static_cast<NSUInteger>(data.clusters.size()),
-        virtual_geometry_bounds(data.clusters)}};
+        virtual_geometry_bounds(data.clusters), std::move(*reservation)}};
   }
 
   std::expected<std::unique_ptr<rhi::GpuMesh>, rhi::RenderError>
@@ -1368,7 +1410,21 @@ public:
     });
     const std::size_t vertex_stride =
         skinned ? sizeof(PackedMeshVertex) : sizeof(PackedStaticMeshVertex);
+    if (data.vertices.size() > std::numeric_limits<std::size_t>::max() / vertex_stride)
+      return std::unexpected(rhi::RenderError{.code = rhi::RenderErrorCode::invalid_mesh,
+          .message = "Mesh vertex buffer size overflows addressable memory."});
     const std::size_t vertex_bytes = data.vertices.size() * vertex_stride;
+    const std::size_t index_bytes = data.indices.size_bytes();
+    const std::size_t morph_bytes = data.vertices.size() * data.morph_targets.size() * sizeof(PackedMorphDelta);
+    if (vertex_bytes > std::numeric_limits<std::size_t>::max() - index_bytes ||
+        vertex_bytes + index_bytes > std::numeric_limits<std::size_t>::max() - morph_bytes)
+      return std::unexpected(rhi::RenderError{.code = rhi::RenderErrorCode::invalid_mesh,
+          .message = "Mesh resource sizes overflow addressable memory."});
+    auto reservation = memory_budget_.reserve(core::MemoryPool::unified, core::MemoryClass::geometry,
+                                               vertex_bytes + index_bytes + morph_bytes);
+    if (!reservation)
+      return std::unexpected(rhi::RenderError{.code = rhi::RenderErrorCode::resource_creation_failed,
+          .message = "Mesh exceeds the configured unified-memory budget: " + reservation.error().message});
     id<MTLBuffer> vertices = [device_ newBufferWithLength:vertex_bytes
                                                    options:MTLResourceStorageModeShared];
     if (vertices != nil) {
@@ -1426,7 +1482,8 @@ public:
                                                        morph_deltas,
                                                        static_cast<NSUInteger>(data.morph_targets.size()),
                                                        static_cast<NSUInteger>(data.vertices.size()),
-                                                       std::move(morph_delta_radii)}};
+                                                       std::move(morph_delta_radii),
+                                                       std::move(*reservation)}};
   }
 
   std::expected<std::unique_ptr<rhi::GpuTexture>, rhi::RenderError>
@@ -1438,6 +1495,21 @@ public:
           .code = rhi::RenderErrorCode::resource_creation_failed,
           .message = "Texture dimensions or tightly-packed RGBA8 payload are invalid."});
     }
+    std::size_t mip_bytes = 0;
+    for (std::uint32_t width = data.width, height = data.height;;
+         width = std::max(1U, width / 2U), height = std::max(1U, height / 2U)) {
+      const std::size_t level_bytes = static_cast<std::size_t>(width) * height * 4U;
+      if (level_bytes > std::numeric_limits<std::size_t>::max() - mip_bytes)
+        return std::unexpected(rhi::RenderError{.code = rhi::RenderErrorCode::resource_creation_failed,
+            .message = "Texture mip chain size overflows addressable memory."});
+      mip_bytes += level_bytes;
+      if (width == 1U && height == 1U) break;
+    }
+    auto reservation = memory_budget_.reserve(core::MemoryPool::unified, core::MemoryClass::texture,
+                                               mip_bytes);
+    if (!reservation)
+      return std::unexpected(rhi::RenderError{.code = rhi::RenderErrorCode::resource_creation_failed,
+          .message = "Texture exceeds the configured unified-memory budget: " + reservation.error().message});
     MTLTextureDescriptor* descriptor = [MTLTextureDescriptor
         texture2DDescriptorWithPixelFormat:(data.srgb ? MTLPixelFormatRGBA8Unorm_sRGB
                                                       : MTLPixelFormatRGBA8Unorm)
@@ -1468,7 +1540,7 @@ public:
       [blit endEncoding];
       [command commit];
     }
-    return std::unique_ptr<rhi::GpuTexture>{new MetalTexture{texture}};
+    return std::unique_ptr<rhi::GpuTexture>{new MetalTexture{texture, std::move(*reservation)}};
   }
 
   std::expected<std::unique_ptr<rhi::GpuEnvironment>, rhi::RenderError>
@@ -1476,6 +1548,36 @@ public:
     if (const auto valid = rhi::validate_environment(data); !valid)
       return std::unexpected(rhi::RenderError{
           .code = rhi::RenderErrorCode::invalid_scene, .message = valid.error()});
+
+    std::size_t persistent_bytes = 0;
+    const auto add_bytes = [&persistent_bytes](std::size_t bytes) {
+      if (bytes > std::numeric_limits<std::size_t>::max() - persistent_bytes) return false;
+      persistent_bytes += bytes;
+      return true;
+    };
+    const auto add_cube = [&add_bytes](std::uint32_t resolution, std::uint32_t mip_count) {
+      for (std::uint32_t mip = 0; mip < mip_count; ++mip) {
+        const std::size_t side = std::max(1U, resolution >> mip);
+        if (side > std::numeric_limits<std::size_t>::max() / side / 48U ||
+            !add_bytes(side * side * 48U)) return false;
+      }
+      return true;
+    };
+    const auto environment_mips = std::bit_width(data.environment_resolution);
+    if (!add_cube(data.environment_resolution, environment_mips) ||
+        !add_cube(data.irradiance_resolution, 1U) ||
+        !add_cube(data.prefilter_resolution, data.prefilter_mip_count) ||
+        data.brdf_lut_resolution > std::numeric_limits<std::size_t>::max() /
+                                       data.brdf_lut_resolution / 4U ||
+        !add_bytes(static_cast<std::size_t>(data.brdf_lut_resolution) *
+                   data.brdf_lut_resolution * 4U))
+      return std::unexpected(rhi::RenderError{.code = rhi::RenderErrorCode::resource_creation_failed,
+          .message = "Environment texture allocation size overflows addressable memory."});
+    auto reservation = memory_budget_.reserve(core::MemoryPool::unified, core::MemoryClass::texture,
+                                               persistent_bytes);
+    if (!reservation)
+      return std::unexpected(rhi::RenderError{.code = rhi::RenderErrorCode::resource_creation_failed,
+          .message = "Environment exceeds the configured unified-memory budget: " + reservation.error().message});
 
     MTLTextureDescriptor* source_descriptor = [MTLTextureDescriptor
         texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
@@ -1495,7 +1597,6 @@ public:
                 withBytes:data.rgba32f.data()
               bytesPerRow:source_bytes_per_row];
 
-    const NSUInteger environment_mips = std::bit_width(data.environment_resolution);
     id<MTLTexture> environment_cube = make_cube_texture(
         device_, MTLPixelFormatRGBA16Float, data.environment_resolution, environment_mips);
     id<MTLTexture> irradiance_cube = make_cube_texture(
@@ -1629,7 +1730,7 @@ public:
     }
     return std::unique_ptr<rhi::GpuEnvironment>{
         new MetalEnvironment{environment_cube, irradiance_cube, prefiltered_cube, brdf_lut,
-                             data.prefilter_mip_count}};
+                             data.prefilter_mip_count, std::move(*reservation)}};
   }
 
   std::expected<void, rhi::RenderError> render_frame(rhi::Color clear_color) override {
@@ -1712,6 +1813,15 @@ public:
                              .message = "A material uses an unsupported alpha mode."});
       }
       if (item.use_material &&
+          (!std::isfinite(item.material.clearcoat) || item.material.clearcoat < 0.0F ||
+           item.material.clearcoat > 1.0F ||
+           !std::isfinite(item.material.clearcoat_roughness) ||
+           item.material.clearcoat_roughness < 0.0F || item.material.clearcoat_roughness > 1.0F)) {
+        return std::unexpected(rhi::RenderError{
+            .code = rhi::RenderErrorCode::invalid_mesh,
+            .message = "Clearcoat factor and roughness must be finite values in [0, 1]."});
+      }
+      if (item.use_material &&
           (item.material.base_color_texcoord > 1U ||
            item.material.metallic_roughness_texcoord > 1U || item.material.normal_texcoord > 1U ||
            item.material.occlusion_texcoord > 1U || item.material.emissive_texcoord > 1U)) {
@@ -1766,8 +1876,10 @@ private:
       id<MTLDepthStencilState> shadow_depth_state, id<MTLSamplerState> sampler,
       id<MTLSamplerState> taa_sampler, id<MTLSamplerState> shadow_sampler,
       id<MTLSamplerState> ibl_sampler, id<MTLSamplerState> ibl_equirect_sampler,
-      std::array<id<MTLTexture>, shadow_cascade_count> shadow_textures, NSString* device_name)
-      : layer_(layer), device_(device), queue_(queue), scene_pipeline_(scene_pipeline),
+      std::array<id<MTLTexture>, shadow_cascade_count> shadow_textures, NSString* device_name,
+      core::MemoryBudget memory_budget)
+      : layer_(layer), device_(device), queue_(queue), memory_budget_(std::move(memory_budget)),
+        scene_pipeline_(scene_pipeline),
         blend_pipeline_(blend_pipeline), shadow_pipeline_(shadow_pipeline),
         static_scene_pipeline_(static_scene_pipeline), static_blend_pipeline_(static_blend_pipeline),
         static_shadow_pipeline_(static_shadow_pipeline),
@@ -1806,6 +1918,19 @@ private:
       return true;
     constexpr MTLTextureUsage sampled_render_target =
         MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    constexpr std::size_t bytes_per_pixel = 63U;
+    if (width == 0 || height == 0 ||
+        width > std::numeric_limits<std::size_t>::max() / height / bytes_per_pixel)
+      return false;
+    std::size_t target_bytes = static_cast<std::size_t>(width) * height * bytes_per_pixel;
+    for (const auto size : shadow_map_sizes) {
+      const std::size_t shadow_bytes = static_cast<std::size_t>(size) * size * 2U;
+      if (shadow_bytes > std::numeric_limits<std::size_t>::max() - target_bytes) return false;
+      target_bytes += shadow_bytes;
+    }
+    auto target_reservation = memory_budget_.reserve(core::MemoryPool::unified,
+                                                      core::MemoryClass::render_target, target_bytes);
+    if (!target_reservation) return false;
     id<MTLTexture> new_hdr = make_color_texture(device_, MTLPixelFormatRGBA16Float, width, height,
                                                 sampled_render_target);
     id<MTLTexture> new_indirect_diffuse = make_color_texture(
@@ -1848,6 +1973,7 @@ private:
     depth_texture_ = new_depth;
     history_color_ = new_history_color;
     history_depth_ = new_history_depth;
+    render_target_reservation_ = std::move(*target_reservation);
     history_read_index_ = 0;
     history_valid_ = false;
     temporal_frame_index_ = 0;
@@ -1948,6 +2074,11 @@ private:
     if (item.use_material) {
       uniforms.material[0] = material.metallic;
       uniforms.material[1] = material.roughness;
+      uniforms.clearcoat_parameters[0] = material.clearcoat;
+      uniforms.clearcoat_parameters[1] = material.clearcoat_roughness;
+      uniforms.water_parameters[0] = material.water_wave_amplitude;
+      uniforms.water_parameters[1] = material.water_wave_frequency;
+      uniforms.water_parameters[2] = material.water_wave_speed;
       set_color(uniforms.base_color, material.base_color);
       set_color(uniforms.emissive, material.emissive);
       uniforms.material_flags[0] = material.base_color_texture != nullptr;
@@ -1990,7 +2121,9 @@ private:
         has_previous_skin ? item.previous_joint_matrices.size() : item.joint_matrices.size());
     uniforms.scene_params[0] = settings.time_seconds;
     uniforms.scene_params[1] = settings.exposure;
-    uniforms.scene_params[2] = default_fog_density;
+    uniforms.scene_params[2] = settings.atmosphere.fog_density;
+    uniforms.fog_params[0] = settings.atmosphere.fog_extinction;
+    uniforms.fog_params[1] = settings.atmosphere.fog_albedo;
     uniforms.temporal_params[0] = settings.has_previous_view_projection ? 1.0F : 0.0F;
     uniforms.temporal_params[1] = previous_time_seconds_;
     if (const auto* environment =
@@ -3028,15 +3161,24 @@ private:
                   std::unexpected("could not create tone-map encoder")};
             [encoder setRenderPipelineState:post_pipeline_];
             [encoder setFragmentTexture:history_color_[history_write_index] atIndex:0];
+            [encoder setFragmentTexture:history_depth_[history_write_index] atIndex:1];
             [encoder setFragmentSamplerState:taa_sampler_ atIndex:0];
             const float exposure = frame_settings.exposure > 0.0F ? frame_settings.exposure : 1.0F;
-            const float post_params[4] = {exposure, 0.0F, 0.0F, 0.0F};
+            const auto& look = frame_settings.cinematic_post;
+            const auto& bloom = frame_settings.bloom;
+            const auto& dof = frame_settings.depth_of_field;
+            const float post_params[12] = {
+                exposure, look.contrast, look.saturation, look.temperature,
+                look.tint, look.vignette, bloom.enabled ? bloom.intensity : 0.0F,
+                bloom.threshold, dof.focus_distance, dof.focus_range,
+                dof.maximum_blur_pixels, dof.enabled ? 1.0F : 0.0F};
             [encoder setFragmentBytes:post_params length:sizeof(post_params) atIndex:0];
             [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             [encoder endEncoding];
             return std::expected<void, std::string>{};
           });
       if (!graph.use(post, history_color_write_resource, rhi::GraphAccess::read) ||
+          !graph.use(post, history_depth_write_resource, rhi::GraphAccess::read) ||
           !graph.use(post, drawable_resource, rhi::GraphAccess::write))
         return std::unexpected(
             rhi::RenderError{.code = rhi::RenderErrorCode::command_submission_failed,
@@ -3072,6 +3214,8 @@ private:
   __strong CAMetalLayer* layer_;
   __strong id<MTLDevice> device_;
   __strong id<MTLCommandQueue> queue_;
+  core::MemoryBudget memory_budget_;
+  core::MemoryBudget::Reservation render_target_reservation_;
   __strong id<MTLRenderPipelineState> scene_pipeline_;
   __strong id<MTLRenderPipelineState> blend_pipeline_;
   __strong id<MTLRenderPipelineState> shadow_pipeline_;

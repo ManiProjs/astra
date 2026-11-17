@@ -38,6 +38,9 @@ struct SceneUniforms {
     float4 uv_rotation[5];  // cos(rotation), sin(rotation), reserved, reserved
     float4 environment_flags; // enabled, maximum prefilter mip, reserved, reserved
     uint4 morph_flags; // target count, per-instance weights, vertex count, point-light count
+    float4 clearcoat_parameters; // factor, perceptual roughness, reserved, reserved
+    float4 water_parameters; // amplitude, spatial frequency, speed, reserved
+    float4 fog_params; // extinction coefficient, scattering albedo, reserved, reserved
 };
 
 struct PointLight {
@@ -402,6 +405,21 @@ vertex VertexOut astra_vertex(VertexIn input [[stage_in]],
     const float4x4 current_skin = skin_matrix(current_input, scene, joint_matrices);
     float4 local_position = current_skin * float4(current_position, 1.0);
     float4 world = model_transform * local_position;
+    float3 water_normal = float3(0.0, 1.0, 0.0);
+    if (scene.water_parameters.x > 0.0001) {
+        const float frequency = scene.water_parameters.y;
+        const float phase_a = dot(world.xz, float2(frequency, frequency * 0.73)) +
+                              scene.scene_params.x * scene.water_parameters.z;
+        const float phase_b = dot(world.xz, float2(-frequency * 0.43, frequency * 1.17)) -
+                              scene.scene_params.x * scene.water_parameters.z * 0.71;
+        const float amplitude = scene.water_parameters.x;
+        world.y += amplitude * (sin(phase_a) + 0.42 * sin(phase_b));
+        const float gradient_x = amplitude * (frequency * cos(phase_a) -
+                                                frequency * 0.43 * 0.42 * cos(phase_b));
+        const float gradient_z = amplitude * (frequency * 0.73 * cos(phase_a) +
+                                                frequency * 1.17 * 0.42 * cos(phase_b));
+        water_normal = normalize(float3(-gradient_x, 1.0, -gradient_z));
+    }
     if (input.tangent.w == 0.0) {
         const float bend = clamp(input.texcoord1.y, 0.0, 1.0);
         world.xyz += foliage_wind_offset(world.xyz, bend, scene.scene_params.x);
@@ -423,6 +441,14 @@ vertex VertexOut astra_vertex(VertexIn input [[stage_in]],
             previous_input, scene, previous_joint_matrices, uint(scene.skin_flags.y), scene.temporal_params.y,
             previous_model_transform);
         float4 previous_world = previous_model_transform * previous_local_position;
+        if (scene.water_parameters.x > 0.0001) {
+            const float frequency = scene.water_parameters.y;
+            const float phase_a = dot(previous_world.xz, float2(frequency, frequency * 0.73)) +
+                                  scene.temporal_params.y * scene.water_parameters.z;
+            const float phase_b = dot(previous_world.xz, float2(-frequency * 0.43, frequency * 1.17)) -
+                                  scene.temporal_params.y * scene.water_parameters.z * 0.71;
+            previous_world.y += scene.water_parameters.x * (sin(phase_a) + 0.42 * sin(phase_b));
+        }
         if (input.tangent.w == 0.0) {
             const float bend = clamp(input.texcoord1.y, 0.0, 1.0);
             previous_world.xyz += foliage_wind_offset(previous_world.xyz, bend,
@@ -435,7 +461,9 @@ vertex VertexOut astra_vertex(VertexIn input [[stage_in]],
                                   model_transform[2].xyz);
     const float3x3 skin_linear = linear_part(current_skin);
     float3 local_normal = transform_normal(skin_linear, current_normal);
-    out.normal = normalize(transform_normal(model_3x3, local_normal));
+    out.normal = scene.water_parameters.x > 0.0001
+                     ? water_normal
+                     : normalize(transform_normal(model_3x3, local_normal));
     out.color = input.color;
     out.texcoord0 = input.texcoord0;
     out.texcoord1 = input.texcoord1;
@@ -499,6 +527,14 @@ vertex ShadowVertexOut astra_shadow_vertex(VertexIn input [[stage_in]],
     morphed_input.tangent.xyz = morphed_tangent;
     float4 local_position = skinned_position(morphed_input, scene, joint_matrices, model_transform);
     float4 world_position = model_transform * local_position;
+    if (scene.water_parameters.x > 0.0001) {
+        const float frequency = scene.water_parameters.y;
+        const float phase_a = dot(world_position.xz, float2(frequency, frequency * 0.73)) +
+                              scene.scene_params.x * scene.water_parameters.z;
+        const float phase_b = dot(world_position.xz, float2(-frequency * 0.43, frequency * 1.17)) -
+                              scene.scene_params.x * scene.water_parameters.z * 0.71;
+        world_position.y += scene.water_parameters.x * (sin(phase_a) + 0.42 * sin(phase_b));
+    }
     if (input.tangent.w == 0.0) {
         const float bend = clamp(input.texcoord1.y, 0.0, 1.0);
         world_position.xyz += foliage_wind_offset(world_position.xyz, bend, scene.scene_params.x);
@@ -788,6 +824,40 @@ float3 fresnel_schlick(float cosine, float3 f0) {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - cosine, 0.0, 1.0), 5.0);
 }
 
+struct ClearcoatLobe {
+    float3 base_attenuation;
+    float3 specular;
+};
+
+// Shared by the production fragment path and the GPU regression kernel. The
+// clearcoat is a dielectric GGX layer; its Fresnel term attenuates the base layer.
+ClearcoatLobe evaluate_clearcoat_lobe(float n_dot_l, float n_dot_v, float n_dot_h,
+                                      float h_dot_v, float factor, float perceptual_roughness) {
+    const float coat = clamp(factor, 0.0, 1.0);
+    const float roughness = clamp(perceptual_roughness, 0.045, 1.0);
+    const float3 fresnel = fresnel_schlick(h_dot_v, float3(0.04));
+    const float distribution = distribution_ggx(n_dot_h, roughness);
+    const float geometry = geometry_schlick(n_dot_v, roughness) *
+                           geometry_schlick(n_dot_l, roughness);
+    const float denominator = max(4.0 * n_dot_v * max(n_dot_l, 0.001), 0.001);
+    return ClearcoatLobe{1.0 - coat * fresnel,
+                         coat * distribution * geometry * fresnel / denominator};
+}
+
+kernel void astra_clearcoat_validation_kernel(device float4 *output [[buffer(0)]],
+                                               uint index [[thread_position_in_grid]]) {
+    if (index != 0U)
+        return;
+    const ClearcoatLobe disabled = evaluate_clearcoat_lobe(0.8, 0.9, 0.95, 0.9, 0.0, 0.2);
+    const ClearcoatLobe enabled = evaluate_clearcoat_lobe(0.8, 0.9, 0.95, 0.9, 0.85, 0.2);
+    const ClearcoatLobe rough = evaluate_clearcoat_lobe(0.8, 0.9, 0.95, 0.9, 0.85, 0.8);
+    output[0] = float4(disabled.base_attenuation, 1.0);
+    output[1] = float4(disabled.specular, 0.0);
+    output[2] = float4(enabled.base_attenuation, 1.0);
+    output[3] = float4(enabled.specular, 0.0);
+    output[4] = float4(rough.specular, 0.0);
+}
+
 float shadow_pcf(float4 shadow_position, depth2d<float> shadow_map, sampler shadow_sampler,
                  float3 normal, float3 light_direction) {
     if (shadow_position.w <= 0.0)
@@ -902,6 +972,10 @@ fragment SceneFragmentOut astra_fragment(
     float geometry = geometry_schlick(n_dot_v, roughness) * geometry_schlick(n_dot_l, roughness);
     float3 specular =
         distribution * geometry * fresnel / max(4.0 * n_dot_v * max(n_dot_l, 0.001), 0.001);
+    const float clearcoat = clamp(scene.clearcoat_parameters.x, 0.0, 1.0);
+    const float clearcoat_roughness = clamp(scene.clearcoat_parameters.y, 0.045, 1.0);
+    const ClearcoatLobe coat_lobe = evaluate_clearcoat_lobe(
+        n_dot_l, n_dot_v, n_dot_h, h_dot_v, clearcoat, clearcoat_roughness);
     float3 diffuse_weight = (1.0 - fresnel) * (1.0 - metallic);
     const float camera_distance =
         dot(input.world_position - scene.camera_position.xyz, scene.cascade_camera_forward.xyz);
@@ -927,8 +1001,8 @@ fragment SceneFragmentOut astra_fragment(
         const float blend = smoothstep(blend_start, cascade_end, camera_distance);
         visibility = mix(visibility, next_visibility, blend);
     }
-    float3 direct = (diffuse_weight * albedo / M_PI_F + specular) *
-                    (scene.light_radiance.xyz * n_dot_l * visibility);
+    float3 direct = ((diffuse_weight * albedo / M_PI_F + specular) * coat_lobe.base_attenuation +
+                     coat_lobe.specular) * (scene.light_radiance.xyz * n_dot_l * visibility);
 
     // Local emitters use radiometric intensity (W/sr for meter-sized world units), inverse-square
     // attenuation, and a smooth finite-range cutoff. They do not inherit the
@@ -955,10 +1029,15 @@ fragment SceneFragmentOut astra_fragment(
                                      geometry_schlick(local_n_dot_l, roughness);
         const float3 local_specular = local_distribution * local_geometry * local_fresnel /
             max(4.0 * n_dot_v * max(local_n_dot_l, 0.001), 0.001);
+        const ClearcoatLobe local_coat_lobe = evaluate_clearcoat_lobe(
+            local_n_dot_l, n_dot_v, local_n_dot_h, local_h_dot_v,
+            clearcoat, clearcoat_roughness);
         const float range_fade = 1.0 - smoothstep(range * 0.8, range, distance_to_light);
         const float3 irradiance = light.intensity.xyz * (range_fade * range_fade / distance_squared);
         const float3 local_diffuse_weight = (1.0 - local_fresnel) * (1.0 - metallic);
-        direct += (local_diffuse_weight * albedo / M_PI_F + local_specular) * irradiance * local_n_dot_l;
+        direct += ((local_diffuse_weight * albedo / M_PI_F + local_specular) *
+                   local_coat_lobe.base_attenuation + local_coat_lobe.specular) *
+                  irradiance * local_n_dot_l;
     }
 
     float3 sun_direction = normalize(-scene.light_direction.xyz);
@@ -969,6 +1048,7 @@ fragment SceneFragmentOut astra_fragment(
                    : 1.0;
     float3 ambient_diffuse;
     float3 ambient_specular;
+    const float3 ambient_coat_fresnel = fresnel_schlick(n_dot_v, float3(0.04));
     if (scene.environment_flags.x > 0.5) {
         // Diffuse irradiance is cosine-convolved during environment creation.
         const float3 diffuse_irradiance = resources.irradiance_map.sample(resources.environment_sampler, n).rgb;
@@ -977,18 +1057,33 @@ fragment SceneFragmentOut astra_fragment(
             level(roughness * scene.environment_flags.y)).rgb;
         const float2 integrated_brdf =
             resources.brdf_lut.sample(resources.environment_sampler, float2(n_dot_v, roughness)).rg;
-        ambient_diffuse = diffuse_irradiance * albedo * (1.0 - metallic) * ao;
-        ambient_specular = prefiltered * (f0 * integrated_brdf.x + integrated_brdf.y) * ao;
+        const float3 coat_prefiltered = resources.prefiltered_environment.sample(
+            resources.environment_sampler, reflected_direction,
+            level(clearcoat_roughness * scene.environment_flags.y)).rgb;
+        const float2 coat_brdf = resources.brdf_lut.sample(
+            resources.environment_sampler, float2(n_dot_v, clearcoat_roughness)).rg;
+        const float3 coat_environment = clearcoat * coat_prefiltered *
+            (float3(0.04) * coat_brdf.x + coat_brdf.y);
+        ambient_diffuse = diffuse_irradiance * albedo * (1.0 - metallic) *
+                          (1.0 - clearcoat * ambient_coat_fresnel) * ao;
+        ambient_specular = (prefiltered * (f0 * integrated_brdf.x + integrated_brdf.y) *
+                            (1.0 - clearcoat * ambient_coat_fresnel) + coat_environment) * ao;
     } else {
         // Analytic sky remains the compatibility fallback when no environment is assigned.
         const float3 diffuse_environment =
             analytic_sky_radiance(n, 1.0, sun_direction, scene.scene_params.x);
         const float3 specular_environment = analytic_sky_radiance(
             reflected_direction, roughness, sun_direction, scene.scene_params.x);
+        const float3 coat_specular_environment = analytic_sky_radiance(
+            reflected_direction, clearcoat_roughness, sun_direction, scene.scene_params.x);
         const float3 environment_fresnel = fresnel_schlick(n_dot_v, f0);
-        ambient_diffuse = diffuse_environment * albedo * (1.0 - metallic) * ao * 0.42;
-        ambient_specular =
-            specular_environment * environment_fresnel * (1.0 - 0.55 * roughness) * ao * 0.32;
+        ambient_diffuse = diffuse_environment * albedo * (1.0 - metallic) *
+                          (1.0 - clearcoat * ambient_coat_fresnel) * ao * 0.42;
+        ambient_specular = specular_environment * environment_fresnel *
+                           (1.0 - 0.55 * roughness) *
+                           (1.0 - clearcoat * ambient_coat_fresnel) * ao * 0.32;
+        ambient_specular += coat_specular_environment * ambient_coat_fresnel * clearcoat *
+            (1.0 - 0.55 * clearcoat_roughness) * ao * 0.32;
     }
     float3 ambient = ambient_diffuse + ambient_specular;
     float3 emissive = scene.emissive.rgb;
@@ -999,8 +1094,8 @@ fragment SceneFragmentOut astra_fragment(
     const float3 camera_to_surface = input.world_position - scene.camera_position.xyz;
     const float distance_to_camera = length(camera_to_surface);
     const float3 fog_ray = camera_to_surface / max(distance_to_camera, 0.0001);
-    const float fog_density = max(scene.scene_params.z, 0.0001);
-    const float fog_step_length = distance_to_camera / 3.0;
+    const float extinction = max(scene.fog_params.x, 0.0);
+    const float scattering_albedo = clamp(scene.fog_params.y, 0.0, 1.0);
     const float3 fog_sun = normalize(-scene.light_direction.xyz);
     const float forward_scattering = pow(max(dot(fog_ray, fog_sun), 0.0), 8.0) * 0.16;
     float fog_transmittance = 1.0;
@@ -1008,19 +1103,30 @@ fragment SceneFragmentOut astra_fragment(
     // Integrate height-varying participating media along the camera ray.
     // Three bounded samples keep the cost predictable on integrated GPUs.
     for (uint fog_step = 0; fog_step < 3; ++fog_step) {
-        const float ray_distance = (float(fog_step) + 0.5) * fog_step_length;
+        const float ray_distance = (float(fog_step) + 0.5) * distance_to_camera / 3.0;
         const float3 sample_position = scene.camera_position.xyz + fog_ray * ray_distance;
         const float height_delta = max(sample_position.y - scene.camera_position.y, 0.0);
         const float height_density = exp(-height_delta * 0.035);
         const float density_noise = mix(0.82, 1.18, noise2(sample_position.xz * 0.0031));
-        const float local_density = fog_density * height_density * density_noise;
-        const float optical_depth = local_density * fog_step_length;
+        const float local_density = max(scene.scene_params.z, 0.0) * height_density * density_noise;
+        const float optical_depth = extinction * local_density * ray_distance;
         const float sample_transmittance = exp(-optical_depth);
         const float opacity = fog_transmittance * (1.0 - sample_transmittance);
         const float altitude = clamp(sample_position.y * 0.004 + 0.5, 0.0, 1.0);
         const float3 ambient_fog =
             mix(float3(0.43, 0.58, 0.70), float3(0.20, 0.34, 0.50), altitude);
-        const float3 lit_fog = ambient_fog * (1.0 + forward_scattering);
+        // Single-scattering approximation. The scattered radiance at this sample is
+        //   L_s = beta_scat * rho * ds * [L_sky * phase_sky * T_sky + L_sun * phase_sun * T_sun]
+        // with beta_scat = beta_ext * albedo and beta_ext * rho * ds = optical_depth. The
+        // optical depth is folded into the opacity term, so the per-sample source scales
+        // with the albedo: a purely absorbing fog (albedo = 0) scatters nothing, while a
+        // purely scattering fog (albedo = 1) scatters the full incident radiance. The sky
+        // dome and the sun forward-scatter lobe are both attenuated by the albedo. Light
+        // transmittance from the sample back to each source (T_sky, T_sun) and exact phase
+        // functions are omitted as second-order for optically thin media at this sample
+        // budget; forward_scattering remains the directional phase proxy.
+        const float3 lit_fog = scattering_albedo *
+            (ambient_fog + scene.light_radiance.rgb * forward_scattering);
         fog_scattering += lit_fog * opacity;
         fog_transmittance *= sample_transmittance;
     }
@@ -1231,9 +1337,52 @@ fragment TaaFragmentOut astra_taa_fragment(
 
 fragment float4 astra_tonemap_fragment(FullscreenOut input [[stage_in]],
                                        texture2d<float> hdr_color [[texture(0)]],
+                                       texture2d<float> linear_depth [[texture(1)]],
                                        sampler hdr_sampler [[sampler(0)]],
-                                       constant float4 &post_params [[buffer(0)]]) {
-    float3 hdr = hdr_color.sample(hdr_sampler, input.uv).rgb * max(post_params.x, 0.0);
+                                       constant float4 *post_params [[buffer(0)]]) {
+    const uint width = hdr_color.get_width();
+    const uint height = hdr_color.get_height();
+    const float2 texel = 1.0 / float2(width, height);
+    float3 hdr = hdr_color.sample(hdr_sampler, input.uv).rgb;
+    const float threshold = max(post_params[1].w, 0.0);
+    const float bloom_intensity = max(post_params[1].z, 0.0);
+    if (bloom_intensity > 0.0001) {
+        float3 bloom = max(hdr - threshold, 0.0) * 0.40;
+        bloom += max(hdr_color.sample(hdr_sampler, input.uv + float2(texel.x, 0.0)).rgb - threshold, 0.0) * 0.15;
+        bloom += max(hdr_color.sample(hdr_sampler, input.uv - float2(texel.x, 0.0)).rgb - threshold, 0.0) * 0.15;
+        bloom += max(hdr_color.sample(hdr_sampler, input.uv + float2(0.0, texel.y)).rgb - threshold, 0.0) * 0.15;
+        bloom += max(hdr_color.sample(hdr_sampler, input.uv - float2(0.0, texel.y)).rgb - threshold, 0.0) * 0.15;
+        hdr += bloom * bloom_intensity;
+    }
+    const float focus_enabled = post_params[2].w;
+    const float depth = linear_depth.sample(hdr_sampler, input.uv).r;
+    const float blur_radius = focus_enabled > 0.5 && depth < 1.0e19
+        ? clamp(abs(depth - post_params[2].x) / post_params[2].y, 0.0, 1.0) * post_params[2].z
+        : 0.0;
+    if (blur_radius > 0.05) {
+        const float2 offset = texel * blur_radius;
+        float3 blurred = hdr * 0.40;
+        blurred += hdr_color.sample(hdr_sampler, input.uv + float2(offset.x, 0.0)).rgb * 0.15;
+        blurred += hdr_color.sample(hdr_sampler, input.uv - float2(offset.x, 0.0)).rgb * 0.15;
+        blurred += hdr_color.sample(hdr_sampler, input.uv + float2(0.0, offset.y)).rgb * 0.15;
+        blurred += hdr_color.sample(hdr_sampler, input.uv - float2(0.0, offset.y)).rgb * 0.15;
+        hdr = mix(hdr, blurred, clamp(blur_radius / max(post_params[2].z, 0.001), 0.0, 1.0));
+    }
+    hdr *= max(post_params[0].x, 0.0);
     float3 mapped = (hdr * (2.51 * hdr + 0.03)) / (hdr * (2.43 * hdr + 0.59) + 0.14);
+    const float contrast = max(post_params[0].y, 0.0);
+    const float saturation = max(post_params[0].z, 0.0);
+    const float temperature = post_params[0].w;
+    const float tint = post_params[1].x;
+    const float vignette = clamp(post_params[1].y, 0.0, 1.0);
+    mapped = max((mapped - 0.18) * contrast + 0.18, 0.0);
+    mapped *= float3(1.0 + temperature * 0.12 + tint * 0.025,
+                     1.0 + tint * 0.08,
+                     1.0 - temperature * 0.12 - tint * 0.025);
+    const float luminance = dot(mapped, float3(0.2126, 0.7152, 0.0722));
+    mapped = mix(float3(luminance), mapped, saturation);
+    const float2 centered = input.uv * 2.0 - 1.0;
+    const float edge = smoothstep(0.25, 1.45, dot(centered, centered));
+    mapped *= 1.0 - edge * vignette * 0.42;
     return float4(clamp(mapped, 0.0, 1.0), 1.0);
 }
